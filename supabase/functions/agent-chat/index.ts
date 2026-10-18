@@ -207,11 +207,11 @@ function isoDurationToMinutes(v: unknown): number | null {
 }
 
 function extractRecipeFromHtml(html: string): any | null {
-  const blocks = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  const blocks = [...html.matchAll(/<script[^>]*type\s*=\s*(["']?)application\/ld\+json\1[^>]*>([\s\S]*?)<\/script>/gi)];
   const candidates: any[] = [];
   for (const b of blocks) {
     try {
-      const parsed = JSON.parse(b[1].trim());
+        const parsed = JSON.parse(b[2].trim());
       const queue = [parsed];
       while (queue.length) {
         const node = queue.pop();
@@ -256,7 +256,7 @@ function normalizeRecipe(r: any) {
     cook_minutes: isoDurationToMinutes(r.cookTime),
     cuisine: Array.isArray(r.recipeCuisine) ? String(r.recipeCuisine[0] ?? "") : (r.recipeCuisine ?? ""),
     image: typeof r.image === "string" ? r.image : (Array.isArray(r.image) ? (typeof r.image[0] === "string" ? r.image[0] : r.image[0]?.url) : null),
-    author: r.author?.name ?? r.author ?? r.publisher?.name ?? null,
+    author: Array.isArray(r.author) ? (r.author.map((a: any) => (typeof a === "string" ? a : (a?.name ?? ""))).filter(Boolean).join(", ") || (r.publisher?.name ?? null)) : ((typeof r.author === "string" ? r.author : (r.author?.name ?? r.publisher?.name ?? null))),
     ingredients,
     steps,
     sourceUrl,
