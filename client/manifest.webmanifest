@@ -1,13 +1,12 @@
 {
-  "name": "Meal Prep AI",
+  "name": "Your kitchen (meal prep preview)",
   "short_name": "Kitchen",
   "description": "Talk it out: your kitchen plans itself. Meal plans, shopping lists, and cook-day guides fall out of the conversation.",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "background_color": "#FBF7F0",
   "theme_color": "#FBF7F0",
-  "orientation": "portrait",
   "icons": [
-    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
   ]
 }
