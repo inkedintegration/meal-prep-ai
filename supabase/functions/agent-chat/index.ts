@@ -538,7 +538,17 @@ Rules:
 - save_profile: when they want to KEEP the current setup in a slot ("keep this setup in profile 2", "save this as profile 3"). name = the slot label like "profile 2".
 - switch_profile: when they want to USE another slot ("switch to profile 2", "use profile 3"). name = the slot label like "profile 2". Slots are labeled Profile 1..3, never invented names.
 - plan_week: when they want the week planned, explicitly or clearly implied.
+- know-how: if the message is a general food/cooking question (technique, doneness, substitution, storage, safety, leftovers, how-to) and NOT a planning action, return parts: [] so the app can answer it directly. reply = a short direct answer (2-4 sentences).
 - reply: acknowledge what you caught; warm, human, brief; never mention being an AI.`;
+
+// ---------- food know-how: the cooking questions (Ashley, r/cookingforbeginners) ----------
+// Pure food/cooking questions get NO parts (the parser returns []), so they land here.
+// The QA brain answers directly, knowing the kitchen's restrictions, allergies and dislikes.
+const KITCHEN_QA_SYSTEM = `You answer food and cooking questions inside a home kitchen app. The person just said something with no planning action attached, so answer it directly as their kitchen companion.
+Tone: warm, plain-spoken, practical. 2-4 sentences; conversation is the app. No em dashes. Never mention being an AI.
+You know their kitchen; honor any dietary restrictions, allergies and disliked ingredients the person's profile shows. If their question touches an ingredient their kitchen avoids, say so plainly.
+Food safety ground rules; use the exact numbers when answering doneness or storage: poultry 165F, ground meats 160F, whole pork/beef steaks 145F, danger zone 40-140F for no more than 2 hours, leftovers 3-4 days refrigerated, cooked rice and grains cool quickly and refrigerate promptly. When unsure, throw it out.
+If their message is not food or kitchen related at all, keep it to one friendly line that gently steers back to the kitchen.`;
 
 // ---------- milestone 3: the one-tap week ----------
 // The planner gets EVERYTHING the kitchen already knows: pantry, profile + rhythms,
@@ -1077,6 +1087,40 @@ Deno.serve(async (req) => {
   );
 
   try {
+    // Deterministic UI commands: taps and form saves from the app carry an exact command,
+    // so they never depend on the LLM parser. Freeform chat still parses as usual.
+    const cmd: any = body?.command ?? null;
+    if (cmd && typeof cmd.type === "string") {
+      const cmdCards: any[] = [];
+      let cmdReply = "";
+      try {
+        switch (cmd.type) {
+          case "switch_profile": {
+            const switched = await toolSwitchProfile(sb, String(cmd.name ?? ""));
+            if (switched.error) {
+              cmdCards.push({ type: "notice", text: switched.message ?? "Switch hiccuped." });
+            } else {
+              cmdReply = `Switched to ${switched.name}. The profile you left kept everything it had.`;
+            }
+            break;
+          }
+          case "set_profile": {
+            const card = await toolSetProfile(sb, (cmd.patch && typeof cmd.patch === "object") ? cmd.patch : {});
+            cmdCards.push(card);
+            cmdReply = ((card as any)?.profile?.active_profile_id) ? "Saved. The profile in use picked up every change." : "Saved your kitchen.";
+          }
+            break;
+          default:
+            cmdReply = "";
+            cmdCards.push({ type: "notice", text: "Unknown command." });
+        }
+      } catch (cmdErr: any) {
+        console.error("command failed", cmd.type, cmdErr?.message ?? cmdErr);
+        return json({ reply: "That tap did not land. Give it another go; the kitchen is safe.", cards: [{ type: "notice", text: String(cmdErr?.message ?? cmdErr).slice(0, 140) }] });
+      }
+      return json({ reply: cmdReply || "The kitchen heard you.", cards: cmdCards });
+    }
+
     let parsed: any = null;
     try {
       let out: string | null = null;
@@ -1118,8 +1162,36 @@ Deno.serve(async (req) => {
     const replyText: string = typeof parsed.reply === "string" && parsed.reply.trim()
       ? parsed.reply.trim()
       : "Right there with you.";
+
     const cards: any[] = [];
     let finalReply = replyText;
+
+    // No planning action in the message? Then it is either a food/cooking question or
+    // just a hello; the QA brain answers it as the kitchen companion. If the QA call
+    // fails, fall back to the parser's short reply so the chat never goes quiet.
+    if (parts.length === 0) {
+      try {
+        const kitchenBits: string[] = [];
+        if (profile && profile[0]) {
+          const p: any = profile[0];
+          if (p.household_size) kitchenBits.push("household of " + p.household_size);
+          if (Array.isArray(p.dietary_restrictions) && p.dietary_restrictions.length) kitchenBits.push("dietary restrictions: " + p.dietary_restrictions.join(", "));
+          if (Array.isArray(p.allergies) && p.allergies.length) kitchenBits.push("allergies: " + p.allergies.join(", "));
+          if (Array.isArray(p.disliked_ingredients) && p.disliked_ingredients.length) kitchenBits.push("nobody likes: " + p.disliked_ingredients.join(", "));
+          if (Array.isArray(p.non_negotiables) && p.non_negotiables.length) kitchenBits.push("non-negotiables: " + p.non_negotiables.join(", "));
+        }
+        const ctx = kitchenBits.length ? "Their kitchen: " + kitchenBits.join("; ") + "." : "Their kitchen profile is still empty.";
+        const qaOut = await callLLM([
+          { role: "system", content: KITCHEN_QA_SYSTEM + "\n" + ctx },
+          { role: "user", content: userText },
+        ]);
+        const qaReply = typeof qaOut === "string" && qaOut.trim() ? qaOut.trim() : "";
+        if (qaReply) finalReply = qaReply;
+      } catch (qaErr: any) {
+        if (qaErr?.code === "missing_key") throw qaErr;
+        console.error("QA brain failed, using parser reply", qaErr?.message ?? qaErr);
+      }
+    }
 
     for (const part of parts.slice(0, 6)) {
       try {

@@ -120,8 +120,8 @@
   }
 
   var busy = false;
-  function send() {
-    var text = draft.value.trim();
+  function send(cmd, bubbleText) {
+    var text = cmd ? String(bubbleText ?? "") : draft.value.trim();
     if (!text || busy) return;
     busy = true;
     sendBtn.disabled = true;
@@ -134,7 +134,7 @@
     fetch(CFG.edgeUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-app-token": CFG.appToken },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify(cmd ? { command: cmd, message: text } : { message: text }),
     })
       .then(function (r) { return r.json(); })
       .then(function (data) {
@@ -207,8 +207,7 @@
       btn.addEventListener("click", function () {
         if (s.is_current) return;
         sheet.hidden = true;
-        draft.value = "switch to " + s.name.toLowerCase();
-        send();
+        send({ type: "switch_profile", name: s.name }, "switch to " + s.name.toLowerCase());
       });
       holder.appendChild(btn);
     });
@@ -273,6 +272,27 @@
     return bits.length ? "Update our kitchen profile: " + bits.join("; ") + "." : "";
   }
 
+  function composeProfilePatch() {
+    var patch = {};
+    var size = document.getElementById("pf-size").value.trim();
+    if (size) patch.household_size = Number(size);
+    var map = [
+      ["dietary_restrictions", "pf-restrictions"],
+      ["allergies", "pf-allergies"],
+      ["cuisines_loved", "pf-loved"],
+      ["cuisines_avoided", "pf-avoided"],
+      ["disliked_ingredients", "pf-disliked"],
+      ["non_negotiables", "pf-nn"]
+    ];
+    map.forEach(function (pair) {
+      var v = document.getElementById(pair[1]).value.trim();
+      if (v) patch[pair[0]] = v.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    });
+    var r = document.getElementById("pf-rhythms").value.trim();
+    if (r) patch.rhythms = r.split(";").map(function (s) { return s.trim(); }).filter(Boolean).map(function (s) { return { kind: "weekly", subject: s, detail: s }; });
+    return patch;
+  }
+
   if (profileBtn) {
     profileBtn.addEventListener("click", function () {
       sheet.hidden = false;
@@ -294,9 +314,9 @@
     document.getElementById("profile-view").hidden = false;
     document.getElementById("profile-form").hidden = true;
     sheet.hidden = true;
-    // the chat shows exactly what was sent; no extra bubble needed
-    draft.value = msg;
-    send();
+    // exact command: no parser involved
+    var patch = composeProfilePatch();
+    send(Object.keys(patch).length ? { type: "set_profile", patch: patch } : null, msg);
   });
 
   addBubble("assistant", "Hey. This is your kitchen taking shape. Tell me what you have, what you love, and what weeknights look like. Tap Plan my week when you're curious; nothing you say is lost.");

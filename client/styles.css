@@ -88,3 +88,4 @@ body {
   cursor: pointer; font-family: inherit; margin: 0 6px 6px 0;
 }
 .pf-slot.current { background: #3D2E6B; color: #fff; border-color: #3D2E6B; cursor: default; }
+.build-tag { opacity: 0.55; letter-spacing: 0.02em; }
