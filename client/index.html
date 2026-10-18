@@ -20,10 +20,33 @@
       <p class="tagline">talk it out. it plans itself.</p>
     </header>
     <main class="thread" id="thread"></main>
+    <div class="quickbar"><button id="quick-plan" class="quick">Plan my week</button><button id="quick-profile" class="quick">Your kitchen</button></div>
     <footer class="composer">
       <textarea id="draft" rows="1" placeholder="What's in your kitchen?" autocomplete="off"></textarea>
       <button id="send" aria-label="Send">Send</button>
     </footer>
+  </div>
+  <div class="sheet" id="profile-sheet" hidden>
+    <div class="sheet-card">
+      <div class="sheet-head">
+        <h2>Your kitchen profile</h2>
+        <button id="profile-close" class="sheet-x" aria-label="Close">×</button>
+      </div>
+      <div id="profile-view"></div>
+      <button id="profile-edit" class="pf-edit" hidden>Edit these</button>
+      <form id="profile-form" hidden>
+        <label>Household size <input id="pf-size" type="number" min="1" max="12" inputmode="numeric" /></label>
+        <label>Dietary restrictions <input id="pf-restrictions" placeholder="vegetarian, halal, .." /></label>
+        <label>Allergies <input id="pf-allergies" placeholder="peanuts, shellfish, .." /></label>
+        <label>Cuisines we love <input id="pf-loved" placeholder="mexican, italian, .." /></label>
+        <label>Cuisines to skip <input id="pf-avoided" placeholder=".." /></label>
+        <label>Ingredients nobody likes <input id="pf-disliked" placeholder="olives, mushrooms, .." /></label>
+        <label>Non-negotiables <input id="pf-nn" placeholder="cake on wednesday, meatless mondays, .." /></label>
+        <label>Weekly rhythms <input id="pf-rhythms" placeholder="pasta once a week; leftovers become weekend lunches" /></label>
+        <button type="submit" class="pf-save">Save changes</button>
+        <p class="pf-hint">Saving speaks for you: it sends one tidy message to your kitchen, so you see exactly what changed.</p>
+      </form>
+    </div>
   </div>
   <script src="config.js"></script>
   <script src="app.js"></script>

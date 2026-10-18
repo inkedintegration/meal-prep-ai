@@ -42,3 +42,40 @@ body {
 .composer button { border: none; background: var(--accent); color: #F7F4EE; font: inherit; font-weight: 600; padding: 12px 20px; border-radius: 14px; min-height: 46px; }
 .composer button:disabled { opacity: 0.45; }
 .typing { align-self: flex-start; color: var(--muted); font-size: 0.9rem; padding: 4px 8px; }
+
+/* one-tap week */
+.quickbar { padding: 8px 16px 0; display: flex; gap: 8px; }
+.quick {
+  border: 1px solid #CFC3E8; background: #F3EEFB; color: #3D2E6B;
+  border-radius: 999px; padding: 8px 14px; font-size: 14px; font-weight: 600;
+  cursor: pointer; font-family: inherit;
+}
+.quick:active { transform: translateY(1px); }
+.card ol { margin: 8px 0 0 18px; padding: 0; }
+.card li { margin: 4px 0; line-height: 1.45; }
+.card .tag { display: inline-block; font-size: 11px; font-weight: 600; color: #6B5CA5; background: #F3EEFB; border-radius: 6px; padding: 1px 6px; margin-left: 6px; }
+
+/* kitchen profile sheet */
+.sheet { position: fixed; inset: 0; background: rgba(44,42,38,.38); display: flex; align-items: flex-end; z-index: 30; }
+.sheet[hidden] { display: none; }
+.sheet-card {
+  background: var(--card); width: 100%; max-width: 560px; margin: 0 auto;
+  border-radius: 18px 18px 0 0; padding: 18px 18px 24px; max-height: 88vh; overflow-y: auto;
+}
+.sheet-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.sheet-head h2 { margin: 0; font-size: 18px; color: var(--ink); }
+.sheet-x { border: 0; background: transparent; font-size: 22px; color: var(--muted); cursor: pointer; padding: 0 4px; }
+.pf-row { margin: 6px 0; font-size: 14.5px; line-height: 1.45; }
+.pf-row b { color: var(--ink); }
+.pf-meta { color: var(--muted); font-size: 12.5px; margin-top: 12px; }
+.pf-edit { margin-top: 14px; border: 1px solid #CFC3E8; background: #F3EEFB; color: #3D2E6B;
+  border-radius: 999px; padding: 8px 14px; font-weight: 600; cursor: pointer; font-family: inherit; }
+#profile-form { margin-top: 14px; display: grid; gap: 10px; }
+#profile-form label { display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); font-weight: 600; }
+#profile-form input {
+  border: 1px solid #D9D2E8; border-radius: 10px; padding: 9px 10px;
+  font: inherit; font-weight: 400; background: #fff; color: var(--ink);
+}
+.pf-save { border: 0; background: var(--accent); color: #fff; border-radius: 999px;
+  padding: 10px 16px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.pf-hint { font-size: 12px; color: var(--muted); margin: 2px 0 0; }

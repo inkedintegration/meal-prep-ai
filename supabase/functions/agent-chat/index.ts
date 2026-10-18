@@ -7,7 +7,7 @@ import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, x-app-token",
 };
 
@@ -182,18 +182,41 @@ async function toolPantryDump(sb: ReturnType<typeof createClient>, items: any[])
 async function toolSetProfile(sb: ReturnType<typeof createClient>, patch: Record<string, any>) {
   const householdId = await ensureHousehold(sb);
   await ensureProfile(sb, householdId);
-  const allowed = [
-    "dietary_restrictions", "allergies", "cuisines_loved", "cuisines_avoided",
-    "disliked_ingredients", "household_size", "time_budget_minutes", "skill_level", "notes", "rhythms",
-  ];
   const update: Record<string, any> = { updated_at: new Date().toISOString() };
-  for (const k of allowed) if (k in patch) update[k] = patch[k];
+  // Array fields: only apply when the parser caught real entries; empty arrays never wipe saved facts.
+  const arrayFields = ["dietary_restrictions", "allergies", "cuisines_loved", "cuisines_avoided", "disliked_ingredients", "non_negotiables"];
+  for (const k of arrayFields) {
+    if (k in patch && Array.isArray(patch[k])) {
+      const arr = patch[k].map(String).map((s: string) => s.trim()).filter(Boolean);
+      if (arr.length) update[k] = arr;
+    }
+  }
+  if ("household_size" in patch && Number(patch.household_size) > 0) update.household_size = Math.round(Number(patch.household_size));
+  if ("time_budget_minutes" in patch && Number(patch.time_budget_minutes) > 0) update.time_budget_minutes = Math.round(Number(patch.time_budget_minutes));
+  for (const k of ["skill_level", "notes"]) {
+    if (k in patch && typeof patch[k] === "string" && patch[k].trim()) update[k] = patch[k].trim().slice(0, 500);
+  }
+  // Rhythms merge by subject: a new rhythm with the same label replaces it, others survive.
+  if (Array.isArray(patch.rhythms) && patch.rhythms.length) {
+    const { data: existing } = await sb.from("taste_profiles").select("rhythms").eq("household_id", householdId).limit(1);
+    const prior: any[] = Array.isArray(existing?.[0]?.rhythms) ? existing[0].rhythms : [];
+    const bySubject = new Map<string, any>();
+    for (const r of prior) if (r && r.subject) bySubject.set(String(r.subject).toLowerCase(), r);
+    for (const r of patch.rhythms.slice(0, 8)) {
+      if (!r || typeof r.subject !== "string" || !r.subject.trim()) continue;
+      bySubject.set(r.subject.trim().toLowerCase(), {
+        kind: ["weekly", "biweekly", "monthly"].includes(String(r.kind)) ? r.kind : "weekly",
+        subject: r.subject.trim().slice(0, 80),
+        detail: typeof r.detail === "string" ? r.detail.trim().slice(0, 200) : "",
+      });
+    }
+    update.rhythms = [...bySubject.values()];
+  }
   const { data, error } = await sb.from("taste_profiles")
-    .update(update).eq("household_id", householdId).select("dietary_restrictions, allergies, cuisines_loved, cuisines_avoided, disliked_ingredients, household_size, time_budget_minutes, notes, rhythms").single();
+    .update(update).eq("household_id", householdId).select("dietary_restrictions, allergies, cuisines_loved, cuisines_avoided, disliked_ingredients, household_size, time_budget_minutes, notes, rhythms, non_negotiables").single();
   if (error) throw error;
   return { type: "profile", profile: data };
 }
-
 // Week constraints ("monday football, thursday classes") attach to the current week's plan.
 function mondayOfCurrentWeek(): string {
   const d = new Date();
@@ -401,7 +424,7 @@ const SYSTEM = `You parse one message from a person preparing their meals for th
 {"reply": "warm brief reply (1-3 sentences)",
  "parts": [
   {"type": "pantry", "items": [{"raw_text": "ingredient as stated", "quantity": number_or_null, "unit": "unit exactly as stated, or null"}]},
-  {"type": "profile", "patch": {"household_size": int_or_absent, "rhythms": [{"kind": "weekly"|"biweekly"|"monthly", "subject": "short label", "detail": "one line"}]}},
+  {"type": "profile", "patch": {"household_size": int_or_absent, "non_negotiables": ["things that MUST happen in the week", "..."], "rhythms": [{"kind": "weekly"|"biweekly"|"monthly", "subject": "short label", "detail": "one line"}]}},
   {"type": "week_context", "constraints": [{"day": "monday|tuesday|...|sunday", "note": "short note"}]},
   {"type": "import_recipe", "url": "..."},
   {"type": "find_recipes", "query": "dish or ingredient keyword", "count": int_1_to_6},
@@ -410,7 +433,7 @@ const SYSTEM = `You parse one message from a person preparing their meals for th
 Rules:
 - Use as many parts as the message contains; real messages usually have several. Omit parts that do not apply.
 - pantry: food they HAVE (pantry/fridge/freezer/shopping haul). Never invent units or quantities they did not state.
-- profile: standing facts only: household_size, dietary_restrictions[], allergies[], cuisines_loved[], cuisines_avoided[], disliked_ingredients[], rhythms (recurring habits like "pasta once a week", "crockpot every two weeks", "leftovers become weekend lunches").
+- profile: standing facts only: household_size, non_negotiables (things that MUST happen this week, like "cake on wednesday", "meatless mondays"), dietary_restrictions[], allergies[], cuisines_loved[], cuisines_avoided[], disliked_ingredients[], rhythms (recurring habits like "pasta once a week", "leftovers become weekend lunches").
 - week_context: constraints for THIS week only (sports, classes, late nights): day + short note.
 - find_recipes: when they ask you to find/pull/suggest recipes ("pull pasta recipes", "find me something with chicken"). query = short keyword; count = how many (default 3).
 - plan_week: when they want the week planned, explicitly or clearly implied.
@@ -911,8 +934,25 @@ steps: ${c.steps.slice(0, 4).map((s: string) => s.slice(0, 100)).join(" | ")}`).
 }
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+  if (req.method === "GET") {
+    const token = req.headers.get("x-app-token") ?? "";
+    if (ACCESS_TOKEN && token !== ACCESS_TOKEN) return fail("Unauthorized", "unauthorized", 401);
+    const sbg = createClient(
+      Deno.env.get("SUPABASE_URL") ?? "",
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "",
+      { auth: { persistSession: false } },
+    );
+    const householdId = await ensureHousehold(sbg);
+    const { data: profile } = await sbg.from("taste_profiles").select("*").eq("household_id", householdId).limit(1);
+    const { count: pantryCount } = await sbg.from("pantry_items").select("*", { count: "exact", head: true }).eq("household_id", householdId);
+    const { count: recipeCount } = await sbg.from("recipes").select("*", { count: "exact", head: true }).eq("household_id", householdId);
+    return new Response(JSON.stringify({
+      profile: profile?.[0] ?? null,
+      pantry_count: pantryCount ?? 0,
+      recipe_count: recipeCount ?? 0,
+    }), { headers: { ...CORS, "Content-Type": "application/json" } });
+  }
   if (req.method !== "POST") return fail("POST only", "bad_method", 405);
-
   const token = req.headers.get("x-app-token") ?? "";
   if (ACCESS_TOKEN && token !== ACCESS_TOKEN) return fail("Unauthorized", "unauthorized", 401);
 

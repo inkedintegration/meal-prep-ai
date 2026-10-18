@@ -176,5 +176,111 @@
     }
   });
 
+  // ---------- your kitchen profile ----------
+  var sheet = document.getElementById("profile-sheet");
+  var profileBtn = document.getElementById("quick-profile");
+  var lastProfile = null;
+  var lastCounts = null;
+
+  function fmtList(arr) { return (arr && arr.length) ? arr.join(", ") : "none yet"; }
+
+  function profileRows(p) {
+    return [
+      ["Household", p.household_size ? p.household_size + " people" : "not set yet"],
+      ["Dietary restrictions", fmtList(p.dietary_restrictions)],
+      ["Allergies", fmtList(p.allergies)],
+      ["Cuisines we love", fmtList(p.cuisines_loved)],
+      ["Cuisines to skip", fmtList(p.cuisines_avoided)],
+      ["Ingredients nobody likes", fmtList(p.disliked_ingredients)],
+      ["Non-negotiables", fmtList(p.non_negotiables)],
+      ["Weekly rhythms", (p.rhythms && p.rhythms.length) ? p.rhythms.map(function (r) { return r.subject; }).join("; ") : "none yet"]
+    ];
+  }
+
+  function loadProfile() {
+    var view = document.getElementById("profile-view");
+    view.innerHTML = "";
+    document.getElementById("profile-edit").hidden = true;
+    document.getElementById("profile-form").hidden = true;
+    fetch(CFG.edgeUrl, { headers: { "x-app-token": CFG.appToken } })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        lastProfile = d.profile || {};
+        lastCounts = { pantry: d.pantry_count, recipes: d.recipe_count };
+        profileRows(lastProfile).forEach(function (row) {
+          var n = el("p", "pf-row");
+          var b = document.createElement("b");
+          b.textContent = row[0] + ": ";
+          n.appendChild(b);
+          n.appendChild(document.createTextNode(row[1]));
+          view.appendChild(n);
+        });
+        var m = el("p", "pf-meta");
+        m.textContent = "It also knows: " + (lastCounts.pantry || 0) + " pantry items and " + (lastCounts.recipes || 0) + " saved recipes.";
+        view.appendChild(m);
+        document.getElementById("profile-edit").hidden = false;
+      })
+      .catch(function () {
+        view.appendChild(el("p", "pf-row", "Could not load your profile just now. Try again in a moment."));
+      });
+  }
+
+  function fillForm(p) {
+    document.getElementById("pf-size").value = p.household_size || "";
+    document.getElementById("pf-restrictions").value = (p.dietary_restrictions || []).join(", ");
+    document.getElementById("pf-allergies").value = (p.allergies || []).join(", ");
+    document.getElementById("pf-loved").value = (p.cuisines_loved || []).join(", ");
+    document.getElementById("pf-avoided").value = (p.cuisines_avoided || []).join(", ");
+    document.getElementById("pf-disliked").value = (p.disliked_ingredients || []).join(", ");
+    document.getElementById("pf-nn").value = (p.non_negotiables || []).join(", ");
+    document.getElementById("pf-rhythms").value = (p.rhythms || []).map(function (r) { return r.subject; }).join("; ");
+  }
+
+  function composeProfileMessage() {
+    var bits = [];
+    var size = document.getElementById("pf-size").value.trim();
+    if (size) bits.push("household of " + size);
+    var pairs = [
+      ["dietary restrictions", "pf-restrictions"],
+      ["allergies", "pf-allergies"],
+      ["cuisines we love", "pf-loved"],
+      ["cuisines to skip", "pf-avoided"],
+      ["nobody likes", "pf-disliked"],
+      ["non-negotiables", "pf-nn"],
+      ["rhythms", "pf-rhythms"]
+    ];
+    pairs.forEach(function (pair) {
+      var v = document.getElementById(pair[1]).value.trim();
+      if (v) bits.push(pair[0] + ": " + v);
+    });
+    return bits.length ? "Update our kitchen profile: " + bits.join("; ") + "." : "";
+  }
+
+  if (profileBtn) {
+    profileBtn.addEventListener("click", function () {
+      sheet.hidden = false;
+      loadProfile();
+    });
+  }
+  document.getElementById("profile-close").addEventListener("click", function () { sheet.hidden = true; });
+  sheet.addEventListener("click", function (e) { if (e.target === sheet) sheet.hidden = true; });
+  document.getElementById("profile-edit").addEventListener("click", function () {
+    fillForm(lastProfile || {});
+    document.getElementById("profile-view").hidden = true;
+    document.getElementById("profile-edit").hidden = true;
+    document.getElementById("profile-form").hidden = false;
+  });
+  document.getElementById("profile-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var msg = composeProfileMessage();
+    if (!msg) return;
+    document.getElementById("profile-view").hidden = false;
+    document.getElementById("profile-form").hidden = true;
+    sheet.hidden = true;
+    // the chat shows exactly what was sent; no extra bubble needed
+    draft.value = msg;
+    send();
+  });
+
   addBubble("assistant", "Hey. This is your kitchen taking shape. Tell me what you have, what you love, and what weeknights look like. Tap Plan my week when you're curious; nothing you say is lost.");
 })();
