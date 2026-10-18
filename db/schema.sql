@@ -10,7 +10,7 @@ create table if not exists households (
   created_at timestamptz not null default now()
 );
 
--- Taste profile: the anti-overwhelm engine's brain
+-- Taste profile: the anti-overwhelm engine brain
 create table if not exists taste_profiles (
   id uuid primary key default gen_random_uuid(),
   household_id uuid not null references households(id) on delete cascade,
@@ -184,3 +184,7 @@ create index if not exists idx_pantry_household on pantry_items(household_id);
 create index if not exists idx_pantry_use_by on pantry_items(use_by) where use_by is not null;
 create index if not exists idx_ingredients_name on ingredients(canonical_name);
 create index if not exists idx_recipe_steps_recipe on recipe_steps(recipe_id, position);
+
+-- Standing habits ("pasta weekly", "crockpot every 2 weeks") + per-week constraints
+alter table taste_profiles add column if not exists rhythms jsonb not null default '[]';
+alter table week_plans add column if not exists constraints jsonb not null default '[]';

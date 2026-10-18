@@ -1,7 +1,7 @@
-// agent-chat: the chef brain, milestone 2.
-// One public endpoint. Flow: chat text -> LLM intent parse (single shot) -> server-side tools.
+// agent-chat: the chef brain, milestone 2 (v2: multi-part parsing).
+// One public endpoint. Flow: chat text -> single-shot LLM parse into parts -> server-side tools.
 // The OpenRouter key and the service role key never leave this function.
-// v1 keeps the agent honest: parse -> act -> report. No silent magic, no fake data.
+// Golden fixture: tests/fixtures/real-week-prep-001.md. Any prompt change gets checked against it.
 
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 
@@ -43,7 +43,7 @@ async function callLLM(messages: { role: string; content: string }[]): Promise<s
       body: JSON.stringify({
         model,
         messages,
-        max_tokens: 2000,
+        max_tokens: 3000,
         temperature: 0.3,
       }),
     });
@@ -54,7 +54,7 @@ async function callLLM(messages: { role: string; content: string }[]): Promise<s
       lastErr = new Error("empty_completion");
       continue;
     }
-    // 402 = no credits, 404 = unknown model: fall through to the next model.
+    // 402 = no credits, 404 = unknown model, 429 = rate limited: fall through.
     if (res.status === 402 || res.status === 404 || res.status === 429) {
       lastErr = new Error(`model_${model}_status_${res.status}`);
       continue;
@@ -112,10 +112,10 @@ async function toolPantryDump(sb: ReturnType<typeof createClient>, items: any[])
       source: "brain-dump",
       confirmed: false,
     }));
-  if (rows.length === 0) return { card: null };
+  if (rows.length === 0) return null;
   const { data, error } = await sb.from("pantry_items").insert(rows).select("id, raw_text, quantity");
   if (error) throw error;
-  return { card: { type: "pantry_review", items: data } };
+  return { type: "pantry_review", items: data };
 }
 
 async function toolSetProfile(sb: ReturnType<typeof createClient>, patch: Record<string, any>) {
@@ -123,14 +123,53 @@ async function toolSetProfile(sb: ReturnType<typeof createClient>, patch: Record
   await ensureProfile(sb, householdId);
   const allowed = [
     "dietary_restrictions", "allergies", "cuisines_loved", "cuisines_avoided",
-    "disliked_ingredients", "household_size", "time_budget_minutes", "skill_level", "notes",
+    "disliked_ingredients", "household_size", "time_budget_minutes", "skill_level", "notes", "rhythms",
   ];
   const update: Record<string, any> = { updated_at: new Date().toISOString() };
   for (const k of allowed) if (k in patch) update[k] = patch[k];
   const { data, error } = await sb.from("taste_profiles")
-    .update(update).eq("household_id", householdId).select("*").single();
+    .update(update).eq("household_id", householdId).select("dietary_restrictions, allergies, cuisines_loved, cuisines_avoided, disliked_ingredients, household_size, time_budget_minutes, notes, rhythms").single();
   if (error) throw error;
-  return { card: { type: "profile", profile: data } };
+  return { type: "profile", profile: data };
+}
+
+// Week constraints ("monday football, thursday classes") attach to the current week's plan.
+function mondayOfCurrentWeek(): string {
+  const d = new Date();
+  const day = (d.getDay() + 6) % 7; // monday = 0
+  d.setDate(d.getDate() - day);
+  return d.toISOString().slice(0, 10);
+}
+
+async function toolWeekContext(sb: ReturnType<typeof createClient>, constraints: any[]) {
+  const householdId = await ensureHousehold(sb);
+  const weekOf = mondayOfCurrentWeek();
+  const clean = (Array.isArray(constraints) ? constraints : [])
+    .filter((c) => c && typeof c.day === "string" && typeof c.note === "string" && c.note.trim())
+    .map((c) => ({ day: c.day.toLowerCase(), note: c.note.trim() }))
+    .slice(0, 7);
+  if (clean.length === 0) return null;
+
+  const { data: existing } = await sb.from("week_plans")
+    .select("id, constraints").eq("household_id", householdId).eq("week_of", weekOf).limit(1);
+
+  let planId: string;
+  let merged: any[] = clean;
+  if (existing && existing.length > 0) {
+    planId = existing[0].id as string;
+    const prior: any[] = Array.isArray(existing[0].constraints) ? existing[0].constraints : [];
+    const byDay = new Map<string, string>();
+    for (const c of prior) byDay.set(c.day, c.note);
+    for (const c of clean) byDay.set(c.day, c.note); // latest wins per day
+    merged = [...byDay.entries()].map(([day, note]) => ({ day, note }));
+    await sb.from("week_plans").update({ constraints: merged }).eq("id", planId);
+  } else {
+    const { data: created, error } = await sb.from("week_plans")
+      .insert({ household_id: householdId, week_of: weekOf, constraints: merged }).select("id").single();
+    if (error) throw error;
+    planId = created.id as string;
+  }
+  return { type: "week_context", week_of: weekOf, constraints: merged };
 }
 
 function isoDurationToMinutes(v: unknown): number | null {
@@ -280,39 +319,39 @@ steps: ${JSON.stringify(n.steps)}`;
   if (stepRows.length) await sb.from("recipe_steps").insert(stepRows);
 
   return {
-    card: {
-      type: "recipe",
-      recipe: {
-        id: recipe.id,
-        title: recipe.title,
-        attribution: recipe.attribution,
-        source_url: url,
-        quality_score: recipe.quality_score,
-        quality_notes: recipe.quality_notes,
-        servings: recipe.servings,
-        ingredients_count: ingRows.length,
-        steps_count: stepRows.length,
-      },
+    type: "recipe",
+    recipe: {
+      id: recipe.id,
+      title: recipe.title,
+      attribution: recipe.attribution,
+      source_url: url,
+      quality_score: recipe.quality_score,
+      quality_notes: recipe.quality_notes,
+      servings: recipe.servings,
+      ingredients_count: ingRows.length,
+      steps_count: stepRows.length,
     },
   };
 }
 
-// ---------- intent prompt ----------
+// ---------- intent prompt (v2: parts, benchmarked on tests/fixtures/real-week-prep-001.md) ----------
 
-const SYSTEM = `You are the intent parser inside a calm, conversational meal-prep app. The user is talking to their kitchen.
-Reply ONLY with JSON, no markdown, no prose:
-{"intent": "chat"|"pantry_dump"|"import_recipe"|"plan_week"|"set_profile",
- "reply": "a warm, brief reply to the user (1-3 sentences, required for chat, optional otherwise)",
- "items": [{"raw_text": "ingredient as stated", "quantity": number_or_null, "unit": string_or_null}],
- "url": "recipe url",
- "profile_patch": {}}
+const SYSTEM = `You parse one message from a person preparing their meals for the week. Extract every useful part. Reply ONLY with JSON, no markdown, no prose:
+{"reply": "warm brief reply (1-3 sentences)",
+ "parts": [
+  {"type": "pantry", "items": [{"raw_text": "ingredient as stated", "quantity": number_or_null, "unit": "unit exactly as stated, or null"}]},
+  {"type": "profile", "patch": {"household_size": int_or_absent, "rhythms": [{"kind": "weekly"|"biweekly"|"monthly", "subject": "short label", "detail": "one line"}]}},
+  {"type": "week_context", "constraints": [{"day": "monday|tuesday|...|sunday", "note": "short note"}]},
+  {"type": "import_recipe", "url": "..."},
+  {"type": "plan_week"}
+ ]}
 Rules:
-- pantry_dump when the user lists food they have (fridge dump, shopping haul, "I have chicken, rice...").
-- import_recipe when the user shares a recipe URL they want saved.
-- set_profile when they say things like "we are vegetarian", "no dairy", "household of 3", "love thai", "hate cilantro", "45 minutes sundays". Map: dietary_restrictions[] (lowercase, e.g. vegetarian, dairy-free, gluten-free, halal, kosher), allergies[], cuisines_loved[], cuisines_avoided[], disliked_ingredients[], household_size (int), time_budget_minutes (int), notes (anything else useful, e.g. "two kids, one picky").
-- plan_week when they ask you to plan the week or meals.
-- otherwise chat.
-- Keep "reply" warm and human, never say you are an AI language model.`;
+- Use as many parts as the message contains; real messages usually have several. Omit parts that do not apply.
+- pantry: food they HAVE (pantry/fridge/freezer/shopping haul). Never invent units or quantities they did not state.
+- profile: standing facts only: household_size, dietary_restrictions[], allergies[], cuisines_loved[], cuisines_avoided[], disliked_ingredients[], rhythms (recurring habits like "pasta once a week", "crockpot every two weeks", "leftovers become weekend lunches").
+- week_context: constraints for THIS week only (sports, classes, late nights): day + short note.
+- plan_week: when they want the week planned, explicitly or clearly implied.
+- reply: acknowledge what you caught; warm, human, brief; never mention being an AI.`;
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
@@ -351,35 +390,71 @@ Deno.serve(async (req) => {
       throw e;
     }
 
-    if (!parsed || typeof parsed.intent !== "string") {
+    if (!parsed) {
       return json({ reply: "Hmm, I lost the thread there for a second. Say that again?", cards: [] });
     }
 
-    switch (parsed.intent) {
-      case "pantry_dump": {
-        const items = Array.isArray(parsed.items) ? parsed.items : [{ raw_text: userText }];
-        const { card } = await toolPantryDump(sb, items);
-        return json({ reply: parsed.reply ?? "Got it. Here is what I caught; anything missing?", cards: card ? [card] : [] });
-      }
-      case "import_recipe": {
-        const url = typeof parsed.url === "string" ? parsed.url : (userText.match(/https?:\/\/\S+/)?.[0] ?? "");
-        const result = await toolImportRecipe(sb, url);
-        if (result.error) return json({ reply: parsed.reply ?? result.message, cards: [], error: result.error });
-        return json({ reply: parsed.reply ?? "Saved. Here is what I imported:", cards: [result.card] });
-      }
-      case "set_profile": {
-        const { card } = await toolSetProfile(sb, parsed.profile_patch ?? {});
-        return json({ reply: parsed.reply ?? "Noted. I will cook around that.", cards: [card] });
-      }
-      case "plan_week": {
-        return json({
-          reply: parsed.reply ?? "The one-tap week lands in milestone 3. For now: stock the pantry and drop in a recipe link or two, and I will be ready.",
-          cards: [{ type: "plan_stub" }],
-        });
-      }
-      default:
-        return json({ reply: parsed.reply ?? "Right there with you.", cards: [] });
+    // Back-compat: v1 shape (single intent) wraps into one part.
+    let parts: any[] = Array.isArray(parsed.parts) ? parsed.parts : [];
+    if (parts.length === 0 && typeof parsed.intent === "string") {
+      const legacy = { type: parsed.intent === "pantry_dump" ? "pantry" : parsed.intent === "set_profile" ? "profile" : parsed.intent };
+      if (legacy.type === "pantry") legacy.items = parsed.items;
+      if (legacy.type === "profile") legacy.patch = parsed.profile_patch;
+      if (legacy.type === "import_recipe") legacy.url = parsed.url;
+      parts = [legacy];
     }
+
+    const replyText: string = typeof parsed.reply === "string" && parsed.reply.trim()
+      ? parsed.reply.trim()
+      : "Right there with you.";
+    const cards: any[] = [];
+    let planMentioned = false;
+
+    for (const part of parts.slice(0, 6)) {
+      try {
+        switch (part?.type) {
+          case "pantry": {
+            const card = await toolPantryDump(sb, Array.isArray(part.items) ? part.items : [{ raw_text: userText }]);
+            if (card) cards.push(card);
+            break;
+          }
+          case "profile": {
+            const card = await toolSetProfile(sb, part.patch ?? {});
+            cards.push(card);
+            break;
+          }
+          case "week_context": {
+            const card = await toolWeekContext(sb, part.constraints);
+            if (card) cards.push(card);
+            break;
+          }
+          case "import_recipe": {
+            const url = typeof part.url === "string" ? part.url : (userText.match(/https?:\/\/\S+/)?.[0] ?? "");
+            const result = await toolImportRecipe(sb, url);
+            if (result.error) cards.push({ type: "notice", text: result.message });
+            else cards.push(result);
+            break;
+          }
+          case "plan_week": {
+            planMentioned = true;
+            cards.push({ type: "plan_stub" });
+            break;
+          }
+          default:
+            break;
+        }
+      } catch (e: any) {
+        console.error("part failed", part?.type, e?.message ?? e);
+        cards.push({ type: "notice", text: "One part of that did not land. The rest is saved." });
+      }
+    }
+
+    let finalReply = replyText;
+    if (planMentioned) {
+      finalReply += " The one-tap week lands in milestone 3; your week notes are already kept.";
+    }
+
+    return json({ reply: finalReply, cards });
   } catch (e: any) {
     console.error("agent-chat error", e?.message ?? e);
     return fail("Something broke in the kitchen. The details are in the function logs.", "server_error", 500);

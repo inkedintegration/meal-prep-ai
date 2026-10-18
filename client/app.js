@@ -40,8 +40,7 @@
       var r = card.recipe;
       c.appendChild(el("h3", null, r.title));
       if (r.quality_score != null) {
-        var s = el("span", "score", "chef score: " + r.quality_score + "/100");
-        c.appendChild(s);
+        c.appendChild(el("span", "score", "chef score: " + r.quality_score + "/100"));
       }
       c.appendChild(el("p", "meta", (r.ingredients_count || 0) + " ingredients, " + (r.steps_count || 0) + " steps" + (r.servings ? ", serves " + r.servings : "")));
       if (r.quality_notes && r.quality_notes.length) {
@@ -56,6 +55,21 @@
       p.appendChild(a);
       c.appendChild(p);
       thread.appendChild(c);
+    } else if (card.type === "week_context" && card.constraints) {
+      c.appendChild(el("h3", null, "This week"));
+      c.appendChild(el("p", "meta", "Kept with the plan:"));
+      var wl = el("ul");
+      card.constraints.forEach(function (ct) {
+        wl.appendChild(el("li", null, ct.day + ": " + ct.note));
+      });
+      c.appendChild(wl);
+      thread.appendChild(c);
+    } else if (card.type === "plan_stub") {
+      c.appendChild(el("h3", null, "One-tap week"));
+      c.appendChild(el("p", "meta", "Coming in milestone 3. Your week notes are already saved."));
+      thread.appendChild(c);
+    } else if (card.type === "notice") {
+      thread.appendChild(el("div", "bubble notice", card.text || ""));
     } else if (card.type === "profile" && card.profile) {
       c.appendChild(el("h3", null, "Your kitchen profile"));
       var bits = [];
@@ -67,6 +81,7 @@
       (p2.disliked_ingredients || []).forEach(function (x) { bits.push("no " + x); });
       if (p2.household_size) bits.push("household of " + p2.household_size);
       if (p2.time_budget_minutes) bits.push(p2.time_budget_minutes + " min cook days");
+      (p2.rhythms || []).forEach(function (x) { bits.push(x.subject + " (" + x.kind + ")"); });
       if (p2.notes) bits.push(p2.notes);
       c.appendChild(el("p", "meta", bits.length ? bits.join(" · ") : "Profile saved."));
       thread.appendChild(c);
