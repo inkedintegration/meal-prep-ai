@@ -11,3 +11,15 @@ Read `docs/SPEC.md` first. Status and phase: skeleton stage. The repo name is a 
 - Clean-room: concepts may come from studying open-source meal apps (Mealie et al.), no code copied. License posture lives in docs/DECISIONS.md.
 - Recipe content is imported into private user space with attribution and linkback; no republishing of site prose.
 - v1 is a single-user PWA; $0/month during build; nothing monetized yet.
+
+## Run it
+
+```bash
+npm install
+npm run dev        # local dev
+npm run build      # production build
+```
+
+Copy `.env.example` to `.env.local` and fill in the Supabase project URL + anon key (project `meal-prep-ai`, ref dwrzfzhmqjtzehpiqmzn). The OpenRouter key lives only in a Supabase Edge Function secret, never in the client.
+
+Roadmap lives in docs/SPEC.md (build order); rationale in docs/DECISIONS.md.
