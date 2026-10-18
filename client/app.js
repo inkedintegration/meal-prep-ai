@@ -197,6 +197,22 @@
     ];
   }
 
+  function renderProfileSets(sets) {
+    var holder = document.getElementById("profile-sets");
+    holder.innerHTML = "";
+    var title = el("p", "pf-meta", "Profiles: tap to switch. The one in use is what plans are built from; edits above change it.");
+    holder.appendChild(title);
+    (sets || []).forEach(function (s) {
+      var btn = el("button", "pf-slot" + (s.is_current ? " current" : ""), s.name + (s.is_current ? " · in use" : ""));
+      btn.addEventListener("click", function () {
+        if (s.is_current) return;
+        sheet.hidden = true;
+        draft.value = "switch to " + s.name.toLowerCase();
+        send();
+      });
+      holder.appendChild(btn);
+    });
+  }
   function loadProfile() {
     var view = document.getElementById("profile-view");
     view.innerHTML = "";
@@ -218,6 +234,7 @@
         var m = el("p", "pf-meta");
         m.textContent = "It also knows: " + (lastCounts.pantry || 0) + " pantry items and " + (lastCounts.recipes || 0) + " saved recipes.";
         view.appendChild(m);
+        renderProfileSets(d.profiles || []);
         document.getElementById("profile-edit").hidden = false;
       })
       .catch(function () {

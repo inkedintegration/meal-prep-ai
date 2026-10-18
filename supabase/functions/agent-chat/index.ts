@@ -135,11 +135,37 @@ async function ensureHousehold(sb: ReturnType<typeof createClient>) {
 
 async function ensureProfile(sb: ReturnType<typeof createClient>, householdId: string) {
   const { data } = await sb.from("taste_profiles").select("*").eq("household_id", householdId).limit(1);
-  if (data && data.length > 0) return data[0];
-  const { data: created, error } = await sb.from("taste_profiles").insert({ household_id: householdId }).select("*").single();
-  if (error) throw error;
-  return created;
+  let profile: any;
+  if (data && data.length > 0) {
+    profile = data[0];
+  } else {
+    const { data: created, error } = await sb.from("taste_profiles").insert({ household_id: householdId }).select("*").single();
+    if (error) throw error;
+    profile = created;
+  }
+  // every kitchen gets three editable slots; Profile 1 carries the current setup
+  const { data: existingSlots } = await sb.from("kitchen_profiles").select("id, name").eq("household_id", householdId);
+  let slots: any[] = existingSlots ?? [];
+  if (slots.filter((s) => String(s.name).startsWith("Profile ")).length < 3) {
+    const base = currentProfileValues(profile);
+    for (let i = 1; i <= 3; i++) {
+      const nm = "Profile " + i;
+      if (!slots.some((s) => String(s.name) === nm)) {
+        const { data: seeded } = await sb.from("kitchen_profiles")
+          .upsert({ household_id: householdId, name: nm, ...(i === 1 ? base : {}) }, { onConflict: "household_id,name" })
+          .select("id, name").single();
+        if (seeded) slots = [...slots, seeded];
+      }
+    }
+    if (!profile.active_profile_id) {
+      const first = slots.find((s) => String(s.name) === "Profile 1");
+      if (first) await sb.from("taste_profiles").update({ active_profile_id: first.id }).eq("household_id", householdId);
+    }
+    await sb.from("kitchen_profiles").delete().eq("household_id", householdId).neq("name", "Profile 1").neq("name", "Profile 2").neq("name", "Profile 3");
+  }
+  return profile;
 }
+
 
 // ---------- tools ----------
 
@@ -213,8 +239,12 @@ async function toolSetProfile(sb: ReturnType<typeof createClient>, patch: Record
     update.rhythms = [...bySubject.values()];
   }
   const { data, error } = await sb.from("taste_profiles")
-    .update(update).eq("household_id", householdId).select("dietary_restrictions, allergies, cuisines_loved, cuisines_avoided, disliked_ingredients, household_size, time_budget_minutes, notes, rhythms, non_negotiables").single();
+    .update(update).eq("household_id", householdId).select("dietary_restrictions, allergies, cuisines_loved, cuisines_avoided, disliked_ingredients, household_size, time_budget_minutes, notes, rhythms, non_negotiables, active_profile_id").single();
   if (error) throw error;
+  // keep the profile you are using in sync: edits land in its slot too
+  if (data.active_profile_id) {
+    await sb.from("kitchen_profiles").update({ ...currentProfileValues(data), updated_at: new Date().toISOString() }).eq("id", data.active_profile_id);
+  }
   return { type: "profile", profile: data };
 }
 // Week constraints ("monday football, thursday classes") attach to the current week's plan.
@@ -223,6 +253,73 @@ function mondayOfCurrentWeek(): string {
   const day = (d.getDay() + 6) % 7; // monday = 0
   d.setDate(d.getDate() - day);
   return d.toISOString().slice(0, 10);
+}
+
+function currentProfileValues(p: Record<string, any>): Record<string, any> {
+  return {
+    household_size: (p.household_size != null && Number(p.household_size) > 0) ? Math.round(Number(p.household_size)) : 2,
+    dietary_restrictions: Array.isArray(p.dietary_restrictions) ? p.dietary_restrictions : [],
+    allergies: Array.isArray(p.allergies) ? p.allergies : [],
+    cuisines_loved: Array.isArray(p.cuisines_loved) ? p.cuisines_loved : [],
+    cuisines_avoided: Array.isArray(p.cuisines_avoided) ? p.cuisines_avoided : [],
+    disliked_ingredients: Array.isArray(p.disliked_ingredients) ? p.disliked_ingredients : [],
+    non_negotiables: Array.isArray(p.non_negotiables) ? p.non_negotiables : [],
+    rhythms: Array.isArray(p.rhythms) ? p.rhythms : [],
+    time_budget_minutes: p.time_budget_minutes,
+    skill_level: p.skill_level,
+    notes: p.notes,
+  };
+}
+
+function slotNameFrom(label: string): string | null {
+  const m = String(label ?? "").toLowerCase().match(/profile\s*#?\s*(\d)/);
+  if (m) return "Profile " + m[1];
+  return null;
+}
+
+async function toolSaveIntoSlot(sb: ReturnType<typeof createClient>, label: string) {
+  const householdId = await ensureHousehold(sb);
+  await ensureProfile(sb, householdId);
+  const slotName = slotNameFrom(label);
+  if (!slotName) {
+    return { error: true, message: "Which slot? Say: keep this setup in profile 2 (slots 1 to 3)." };
+  }
+  const { data: rows } = await sb.from("taste_profiles").select("*").eq("household_id", householdId).limit(1);
+  const p: any = rows?.[0];
+  if (!p) return { error: true, message: "No kitchen profile to copy yet." };
+  await sb.from("kitchen_profiles")
+    .upsert({ household_id: householdId, name: slotName, ...currentProfileValues(p), updated_at: new Date().toISOString() }, { onConflict: "household_id,name" });
+  return { slot: slotName };
+}
+
+async function toolSwitchProfile(sb: ReturnType<typeof createClient>, name: string) {
+  const householdId = await ensureHousehold(sb);
+  await ensureProfile(sb, householdId);
+  const want = String(name ?? "").trim().toLowerCase().slice(0, 40);
+  const { data: sets } = await sb.from("kitchen_profiles").select("*").eq("household_id", householdId);
+  const list: any[] = sets ?? [];
+  if (list.length === 0) return { error: true, message: "No saved profiles yet. Try: save this profile as dinner party." };
+  const target = list.find((s) => String(s.name).toLowerCase() === want)
+    ?? list.find((s) => String(s.name).toLowerCase().includes(want) && want.length > 2);
+  if (!target) {
+    return { error: true, message: `No slot like that. You have: ${list.map((s) => s.name).join(", ")}.` };
+  }
+  const { data: rows } = await sb.from("taste_profiles").select("*").eq("household_id", householdId).limit(1);
+  const p: any = rows?.[0];
+  // write the kitchen's current values back into the profile we are leaving, so nothing is lost
+  if (p?.active_profile_id) {
+    const leaving = list.find((s) => s.id === p.active_profile_id);
+    if (leaving && leaving.id !== target.id) {
+      await sb.from("kitchen_profiles").update({ ...currentProfileValues(p), updated_at: new Date().toISOString() }).eq("id", leaving.id);
+    }
+  }
+  const { data: afterSwitch, error: switchErr } = await sb.from("taste_profiles").update({
+    ...currentProfileValues(target),
+    active_profile_id: target.id,
+    updated_at: new Date().toISOString(),
+  }).eq("household_id", householdId).select("active_profile_id").single();
+  if (switchErr) throw switchErr;
+  return { type: "profile_switched", name: target.name, profile: target, afterId: afterSwitch?.active_profile_id ?? null };
 }
 
 async function toolWeekContext(sb: ReturnType<typeof createClient>, constraints: any[]) {
@@ -428,6 +525,8 @@ const SYSTEM = `You parse one message from a person preparing their meals for th
   {"type": "week_context", "constraints": [{"day": "monday|tuesday|...|sunday", "note": "short note"}]},
   {"type": "import_recipe", "url": "..."},
   {"type": "find_recipes", "query": "dish or ingredient keyword", "count": int_1_to_6},
+  {"type": "save_profile", "name": "short label"},
+  {"type": "switch_profile", "name": "short label"},
   {"type": "plan_week"}
  ]}
 Rules:
@@ -436,6 +535,8 @@ Rules:
 - profile: standing facts only: household_size, non_negotiables (things that MUST happen this week, like "cake on wednesday", "meatless mondays"), dietary_restrictions[], allergies[], cuisines_loved[], cuisines_avoided[], disliked_ingredients[], rhythms (recurring habits like "pasta once a week", "leftovers become weekend lunches").
 - week_context: constraints for THIS week only (sports, classes, late nights): day + short note.
 - find_recipes: when they ask you to find/pull/suggest recipes ("pull pasta recipes", "find me something with chicken"). query = short keyword; count = how many (default 3).
+- save_profile: when they want to KEEP the current setup in a slot ("keep this setup in profile 2", "save this as profile 3"). name = the slot label like "profile 2".
+- switch_profile: when they want to USE another slot ("switch to profile 2", "use profile 3"). name = the slot label like "profile 2". Slots are labeled Profile 1..3, never invented names.
 - plan_week: when they want the week planned, explicitly or clearly implied.
 - reply: acknowledge what you caught; warm, human, brief; never mention being an AI.`;
 
@@ -946,10 +1047,14 @@ Deno.serve(async (req) => {
     const { data: profile } = await sbg.from("taste_profiles").select("*").eq("household_id", householdId).limit(1);
     const { count: pantryCount } = await sbg.from("pantry_items").select("*", { count: "exact", head: true }).eq("household_id", householdId);
     const { count: recipeCount } = await sbg.from("recipes").select("*", { count: "exact", head: true }).eq("household_id", householdId);
+    const { data: profileSets } = await sbg.from("kitchen_profiles").select("id, name, household_size, dietary_restrictions, allergies, cuisines_loved, cuisines_avoided, disliked_ingredients, non_negotiables, rhythms, updated_at").eq("household_id", householdId).order("created_at");
+    const activeId = (profile && profile[0]) ? profile[0].active_profile_id : null;
+    const sets = (profileSets ?? []).map((s: any) => ({ id: s.id, name: s.name, is_current: s.id === activeId }));
     return new Response(JSON.stringify({
       profile: profile?.[0] ?? null,
       pantry_count: pantryCount ?? 0,
       recipe_count: recipeCount ?? 0,
+      profiles: sets,
     }), { headers: { ...CORS, "Content-Type": "application/json" } });
   }
   if (req.method !== "POST") return fail("POST only", "bad_method", 405);
@@ -1039,6 +1144,18 @@ Deno.serve(async (req) => {
             const result = await toolImportRecipe(sb, url);
             if (result.error) cards.push({ type: "notice", text: result.message });
             else cards.push(result);
+            break;
+          }
+          case "save_profile": {
+            const copied = await toolSaveIntoSlot(sb, typeof part.name === "string" ? part.name : "");
+            if (copied.error) cards.push({ type: "notice", text: copied.message ?? "Save hiccuped." });
+            else finalReply = `Copied this setup into ${copied.slot}. Nothing changed in what you are using now.`;
+            break;
+          }
+          case "switch_profile": {
+            const switched = await toolSwitchProfile(sb, typeof part.name === "string" ? part.name : "");
+            if (switched.error) cards.push({ type: "notice", text: switched.message ?? "Switch hiccuped." });
+            else finalReply = `Switched to ${switched.name}. The profile you left kept everything it had.`;
             break;
           }
           case "find_recipes": {
