@@ -11,7 +11,7 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icon.svg" />
   <title>Your kitchen</title>
-  <link rel="stylesheet" href="styles.css?v=4" />
+  <link rel="stylesheet" href="styles.css?v=5" />
 </head>
 <body>
   <div class="app">
@@ -23,6 +23,8 @@
     <div class="quickbar"><button id="quick-plan" class="quick">Plan my week</button><button id="quick-profile" class="quick">Your kitchen</button></div>
     <footer class="composer">
       <textarea id="draft" rows="1" placeholder="What's in your kitchen?" autocomplete="off"></textarea>
+      <button id="photo" class="cam" aria-label="Add to pantry from a photo">📷</button>
+      <input id="photo-input" type="file" accept="image/*" capture="environment" hidden />
       <button id="send" aria-label="Send">Send</button>
     </footer>
   </div>
@@ -46,11 +48,11 @@
         <label>Weekly rhythms <input id="pf-rhythms" placeholder="pasta once a week; leftovers become weekend lunches" /></label>
         <button type="submit" class="pf-save">Save changes</button>
         <p class="pf-hint">Saving speaks for you: it sends one tidy message to your kitchen, so you see exactly what changed.</p>
-        <p class="pf-hint build-tag">build Oct 18 · v4</p>
+        <p class="pf-hint build-tag">build Oct 19 · v5</p>
       </form>
     </div>
   </div>
   <script src="config.js"></script>
-  <script src="app.js?v=4"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

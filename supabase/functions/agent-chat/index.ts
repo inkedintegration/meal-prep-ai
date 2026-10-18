@@ -18,6 +18,7 @@ const FREE_MODELS = [
   "google/gemma-4-31b-it:free",
   "xingchen-agi/xing4.0-29b-a4b:free",
 ];
+const VISION_MODEL = "google/gemini-2.5-flash-lite"; // vision-capable, cheapest paid vision on OpenRouter; key stays server-side
 const ACCESS_TOKEN = Deno.env.get("APP_ACCESS_TOKEN") ?? "";
 
 function json(body: unknown, status = 200) {
@@ -107,6 +108,46 @@ async function callLLM(messages: { role: string; content: string }[], maxTokens 
   }
   throw Object.assign(lastErr ?? new Error("llm_unavailable"), { code: "llm_unavailable" });
 }
+// Vision pass: one image in, strict JSON of food items out. Non-streaming is fine; extraction is short.
+async function callVisionJSON(imageDataUrl: string): Promise<any | null> {
+  const key = Deno.env.get("OPENROUTER_API_KEY");
+  if (!key) throw Object.assign(new Error("missing_key"), { code: "missing_key" });
+  if (!/^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/.test(imageDataUrl)) {
+    throw Object.assign(new Error("bad_image"), { code: "bad_image" });
+  }
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: VISION_MODEL,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: 'This is a kitchen photo (fridge, pantry shelves, counters) or a grocery receipt. Read it and list every food or drink item you can clearly identify. Ignore brands-only products you cannot name; for receipts list each line item. Return ONLY strict JSON, no prose, no markdown fences: {"items":[{"raw_text":"plain item name, lowercase","quantity":number or null,"unit":"short unit like g|ml|oz|lb|dozen|can|each or null"}]}. No duplicates. If the image shows no identifiable food items, return {"items":[]}.',
+            },
+            { type: "image_url", image_url: { url: imageDataUrl } },
+          ],
+        },
+      ],
+      max_tokens: 1200,
+      temperature: 0.1,
+    }),
+    signal: AbortSignal.timeout(90000),
+  });
+  if (!res.ok) {
+    const b = await res.text().catch(() => "");
+    throw Object.assign(new Error(`vision_status_${res.status}: ${b.slice(0, 160)}`), { code: "vision_unavailable" });
+  }
+  const j = await res.json().catch(() => null);
+  const out = j?.choices?.[0]?.message?.content;
+  if (typeof out !== "string") return null;
+  const parsed = parseJsonLoose(out);
+  return parsed && Array.isArray(parsed.items) ? parsed : null;
+}
+
 
 function parseJsonLoose(text: string): any | null {
   const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
@@ -169,7 +210,7 @@ async function ensureProfile(sb: ReturnType<typeof createClient>, householdId: s
 
 // ---------- tools ----------
 
-async function toolPantryDump(sb: ReturnType<typeof createClient>, items: any[]) {
+async function toolPantryDump(sb: ReturnType<typeof createClient>, items: any[], source = "brain-dump") {
   const householdId = await ensureHousehold(sb);
   const { data: unitRows } = await sb.from("units").select("id, name, abbreviation, aliases");
   const aliasMap = new Map<string, string>();
@@ -195,7 +236,7 @@ async function toolPantryDump(sb: ReturnType<typeof createClient>, items: any[])
         raw_text: i.raw_text.trim(),
         quantity: qty,
         unit_id: unitId,
-        source: "brain-dump",
+        source,
         confirmed: false,
       };
     });
@@ -1110,6 +1151,24 @@ Deno.serve(async (req) => {
             cmdReply = ((card as any)?.profile?.active_profile_id) ? "Saved. The profile in use picked up every change." : "Saved your kitchen.";
           }
             break;
+          case "scan_photo": {
+            // One photo in: fridge shot or grocery receipt. Vision model reads it, items land in the pantry.
+            const dataUrl = String(cmd.image ?? "");
+            if (!dataUrl.startsWith("data:image/")) {
+              cmdCards.push({ type: "notice", text: "That photo did not come through. Try again." });
+              break;
+            }
+            const scan = await callVisionJSON(dataUrl);
+            const items = Array.isArray(scan?.items) ? scan.items.slice(0, 60) : [];
+            if (items.length === 0) {
+              cmdReply = "I looked hard at that photo and could not make out any food items. Close-up and decent light help; give it another try.";
+              break;
+            }
+            const card = await toolPantryDump(sb, items, "photo");
+            if (card) cmdCards.push(card);
+            cmdReply = `Read ${items.length} item${items.length === 1 ? "" : "s"} off your photo and dropped them into the pantry. Anything that looks off, just tell me and it is gone.`;
+            break;
+          }
           default:
             cmdReply = "";
             cmdCards.push({ type: "notice", text: "Unknown command." });

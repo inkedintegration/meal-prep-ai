@@ -28,6 +28,36 @@
   }
 
   function renderCard(card) {
+  // ---------- exports: plain text you can paste anywhere ----------
+  function copyText(text, label) {
+    var done = function () { addNotice("Copied: " + label); };
+    var fallback = function () { addNotice("Copy did not go through on this device; long-press the text instead."); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) { fallback(); }
+      ta.remove();
+    }
+  }
+  function copyBtn(text, label) {
+    var b = el("button", "ghost copy-btn", "Copy");
+    b.addEventListener("click", function () { copyText(text(), label); });
+    return b;
+  }
+  function head(h3, metaText, buildCopy) {
+    var row = el("div", "card-head");
+    var left = el("div", null);
+    left.appendChild(el("h3", null, h3));
+    if (metaText) left.appendChild(el("p", "meta", metaText));
+    row.appendChild(left);
+    if (buildCopy) row.appendChild(buildCopy);
+    return row;
+  }
+
     var c = el("div", "card");
     if (card.type === "pantry_review" && card.items) {
       c.appendChild(el("h3", null, "Pantry check"));
@@ -67,7 +97,13 @@
       c.appendChild(wl);
       thread.appendChild(c);
     } else if (card.type === "week_plan" && card.days) {
-      c.appendChild(el("h3", null, "This week's plan"));
+      var weekText = "THIS WEEK" + (card.week_of ? " (" + card.week_of + ")" : "") + "\n\n" +
+        card.days.map(function (d) {
+          return cap(d.day) + ":\n" + d.meals.map(function (m) {
+            return "  · " + m.slot + ": " + m.title + (m.servings ? " (serves " + m.servings + ")" : "") + (m.note ? " — " + m.note : "");
+          }).join("\n");
+        }).join("\n\n");
+      c.appendChild(head("This week's plan", null, copyBtn(function () { return weekText; }, "this week's plan")));
       var wul = el("ul");
       card.days.forEach(function (d) {
         d.meals.forEach(function (m) {
@@ -77,8 +113,11 @@
       c.appendChild(wul);
       thread.appendChild(c);
     } else if (card.type === "shopping_list" && card.items) {
-      c.appendChild(el("h3", null, "Shopping list"));
-      c.appendChild(el("p", "meta", card.items.length + " to buy" + (card.skipped_have ? " · " + card.skipped_have + " already in your kitchen" : "")));
+      var listMeta = card.items.length + " to buy" + (card.skipped_have ? " · " + card.skipped_have + " already in your kitchen" : "");
+      var listText = "SHOPPING LIST\n\n" + card.items.map(function (it) {
+        return "· " + (it.quantity ? it.quantity + " " : "") + (it.raw_text || "");
+      }).join("\n");
+      c.appendChild(head("Shopping list", listMeta, copyBtn(function () { return listText; }, "the shopping list")));
       var sul = el("ul");
       card.items.forEach(function (it) {
         sul.appendChild(el("li", null, (it.quantity ? it.quantity + " " : "") + (it.raw_text || "")));
@@ -86,8 +125,11 @@
       c.appendChild(sul);
       thread.appendChild(c);
     } else if (card.type === "cook_guide" && card.tasks) {
-      c.appendChild(el("h3", null, "Cook day: " + cap(card.day)));
-      if (card.focus) c.appendChild(el("p", "meta", card.focus));
+      var cookText = "COOK DAY: " + cap(card.day) + "\n" + (card.focus ? card.focus + "\n\n" : "\n") +
+        card.tasks.map(function (t, i) {
+          return (i + 1) + ". " + t.text + (t.minutes ? " (" + t.minutes + " min)" : "");
+        }).join("\n");
+      c.appendChild(head("Cook day: " + cap(card.day), card.focus || null, copyBtn(function () { return cookText; }, "the cook day guide")));
       var ol = el("ol");
       card.tasks.forEach(function (t) {
         ol.appendChild(el("li", null, t.text + (t.minutes ? " (" + t.minutes + " min)" : "")));
@@ -163,6 +205,69 @@
   }
 
   sendBtn.addEventListener("click", send);
+
+  // ---------- photo import: fridge shot or grocery receipt -> pantry ----------
+  var photoBtn = document.getElementById("photo");
+  var photoInput = document.getElementById("photo-input");
+  function sendPhoto(dataUrl, name) {
+    if (busy) { addNotice("One thing at a time: the kitchen is still thinking."); return; }
+    busy = true;
+    sendBtn.disabled = true;
+    addBubble("user", "📷 " + (name || "photo"));
+    var typing = el("div", "typing", "reading the photo…");
+    thread.appendChild(typing);
+    thread.scrollTop = thread.scrollHeight;
+    fetch(CFG.edgeUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-app-token": CFG.appToken },
+      body: JSON.stringify({ command: { type: "scan_photo", image: dataUrl }, message: "what food is in this photo" }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        typing.remove();
+        if (data.error === "missing_key") {
+          addNotice("The photo brain needs its OpenRouter key; it is not set yet. Juno will flip this switch.");
+          return;
+        }
+        if (data.error) {
+          addNotice(data.message || "The photo did not scan. Try a brighter, closer shot.");
+          return;
+        }
+        addBubble("assistant", data.reply || "Okay.");
+        (data.cards || []).forEach(renderCard);
+      })
+      .catch(function () {
+        typing.remove();
+        addNotice("Could not reach the kitchen. Check your connection and try again.");
+      })
+      .finally(function () {
+        busy = false;
+        sendBtn.disabled = false;
+      });
+  }
+  if (photoBtn && photoInput) {
+    photoBtn.addEventListener("click", function () { photoInput.click(); });
+    photoInput.addEventListener("change", function () {
+      var f = photoInput.files && photoInput.files[0];
+      photoInput.value = "";
+      if (!f) return;
+      if (!/^image\//.test(f.type || "")) { addNotice("That file is not an image; a fridge or receipt photo works best."); return; }
+      var img = new Image();
+      var url = URL.createObjectURL(f);
+      img.onload = function () {
+        var scale = Math.min(1, 1024 / Math.max(img.width, img.height));
+        var cv = document.createElement("canvas");
+        cv.width = Math.max(1, Math.round(img.width * scale));
+        cv.height = Math.max(1, Math.round(img.height * scale));
+        cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+        URL.revokeObjectURL(url);
+        sendPhoto(cv.toDataURL("image/jpeg", 0.8), f.name);
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); addNotice("Could not read that image. Try a different photo."); };
+      img.src = url;
+    });
+  }
+
   if (quickBtn) {
     quickBtn.addEventListener("click", function () {
       draft.value = "plan my week";

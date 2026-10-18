@@ -89,3 +89,10 @@ body {
 }
 .pf-slot.current { background: #3D2E6B; color: #fff; border-color: #3D2E6B; cursor: default; }
 .build-tag { opacity: 0.55; letter-spacing: 0.02em; }
+
+/* v5: card headers with copy + photo import */
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 4px; }
+.card-head h3 { margin: 0 0 4px; }
+.card-head .meta { margin: 0; }
+.copy-btn { padding: 7px 14px !important; min-height: 34px; font-size: 0.85rem; border-radius: 10px; }
+.composer .cam { background: transparent; color: var(--accent); border: 1px solid var(--accent); padding: 12px 14px; font-size: 1.05rem; }
