@@ -96,3 +96,17 @@ body {
 .card-head .meta { margin: 0; }
 .copy-btn { padding: 7px 14px !important; min-height: 34px; font-size: 0.85rem; border-radius: 10px; }
 .composer .cam { background: transparent; color: var(--accent); border: 1px solid var(--accent); padding: 12px 14px; font-size: 1.05rem; }
+
+/* v6: pantry sheet */
+.sheet-card-wide { width: min(680px, 94vw); max-height: 86vh; overflow-y: auto; }
+.pantry-sec { margin: 14px 0 4px; }
+.pantry-sec-h { margin: 0 0 8px; font-size: 0.95rem; color: var(--accent); }
+.pantry-row { display: flex; gap: 6px; align-items: center; padding: 5px 0; border-bottom: 1px solid var(--line); }
+.pantry-row input, .pantry-row select { font: inherit; font-size: 0.9rem; border: 1px solid #E0D9CC; border-radius: 8px; padding: 7px 8px; background: var(--bg); min-height: 36px; }
+.pantry-row input:focus, .pantry-row select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.pr-name { flex: 1.6; min-width: 0; }
+.pr-qty { flex: 0.6; min-width: 52px; }
+.pr-unit { flex: 0.7; min-width: 56px; }
+.pr-loc { flex: 1; min-width: 104px; }
+.pr-del { flex: none; border: none; background: transparent; color: #B4552D; font: inherit; font-weight: 700; padding: 6px 8px; min-height: 36px; border-radius: 8px; }
+.pr-removing { opacity: 0.4; }

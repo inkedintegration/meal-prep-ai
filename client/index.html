@@ -6,21 +6,21 @@
   <meta name="theme-color" content="#FBF7F0" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-  <meta name="description" content="Talk it out: your kitchen plans itself. Private preview." />
+  <meta name="description" content="Prep Talk: talk it out and your kitchen plans itself. Private preview." />
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="icon" href="icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icon.svg" />
-  <title>Your kitchen</title>
-  <link rel="stylesheet" href="styles.css?v=5" />
+  <title>Prep Talk</title>
+  <link rel="stylesheet" href="styles.css?v=6" />
 </head>
 <body>
   <div class="app">
     <header class="header">
-      <h1>Your kitchen</h1>
+      <h1>Prep Talk</h1>
       <p class="tagline">talk it out. it plans itself.</p>
     </header>
     <main class="thread" id="thread"></main>
-    <div class="quickbar"><button id="quick-plan" class="quick">Plan my week</button><button id="quick-profile" class="quick">Your kitchen</button></div>
+    <div class="quickbar"><button id="quick-plan" class="quick">Plan my week</button><button id="quick-profile" class="quick">Your kitchen</button><button id="quick-pantry" class="quick">Pantry</button></div>
     <footer class="composer">
       <textarea id="draft" rows="1" placeholder="What's in your kitchen?" autocomplete="off"></textarea>
       <button id="photo" class="cam" aria-label="Add to pantry from a photo">📷</button>
@@ -48,11 +48,23 @@
         <label>Weekly rhythms <input id="pf-rhythms" placeholder="pasta once a week; leftovers become weekend lunches" /></label>
         <button type="submit" class="pf-save">Save changes</button>
         <p class="pf-hint">Saving speaks for you: it sends one tidy message to your kitchen, so you see exactly what changed.</p>
-        <p class="pf-hint build-tag">build Oct 19 · v5</p>
+        <p class="pf-hint build-tag">build Oct 19 · v6</p>
       </form>
     </div>
   </div>
+  <div class="sheet" id="pantry-sheet" hidden>
+    <div class="sheet-card sheet-card-wide">
+      <div class="sheet-head">
+        <h2>Pantry</h2>
+        <button id="pantry-close" class="sheet-x" aria-label="Close">×</button>
+      </div>
+      <div id="pantry-view"></div>
+      <button id="pantry-add-row" class="pf-edit">Add an item</button>
+      <button id="pantry-save" class="pf-save">Save changes</button>
+      <p class="pf-hint">Photos land here too: anything scanned from a receipt or fridge shot shows up unconfirmed until you tidy it.</p>
+    </div>
+  </div>
   <script src="config.js"></script>
-  <script src="app.js?v=5"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>

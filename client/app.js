@@ -425,4 +425,185 @@
   });
 
   addBubble("assistant", "Hey. This is your kitchen taking shape. Tell me what you have, what you love, and what weeknights look like. Tap Plan my week when you're curious; nothing you say is lost.");
+
+  // ---------- pantry: see it, edit it, grouped by where it lives ----------
+  var pantrySheet = document.getElementById("pantry-sheet");
+  var LOCATIONS = [
+    { key: "fridge", label: "Refrigerator" },
+    { key: "freezer", label: "Freezer" },
+    { key: "pantry", label: "Pantry" },
+    { key: "seasonings", label: "Seasonings" },
+  ];
+  var pantryState = [];
+  var sendQueue = Promise.resolve();
+
+  function cmd(type, extra, bubbleText) {
+    var body = { command: Object.assign({ type: type }, extra || {}), message: bubbleText || type.replace(/_/g, " ") };
+    sendQueue = sendQueue.then(function () {
+      return fetch(CFG.edgeUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-app-token": CFG.appToken },
+        body: JSON.stringify(body),
+      }).then(function (r) { return r.json(); }).catch(function () { return null; });
+    });
+    return sendQueue;
+  }
+
+  function pantryRowHTML(item, isNew) {
+    var id = isNew ? "" : item.id;
+    var row = el("div", "pantry-row");
+    row.setAttribute("data-id", id);
+    row.setAttribute("data-original", JSON.stringify({
+      raw_text: isNew ? "" : item.raw_text,
+      quantity: isNew ? "" : (item.quantity == null ? "" : String(item.quantity)),
+      unit: isNew ? "" : (item.unit || ""),
+      location: isNew ? "pantry" : (item.location || "pantry"),
+    }));
+    var name = el("input", "pr-name");
+    name.value = isNew ? "" : (item.raw_text || "");
+    name.placeholder = "item name";
+    row.appendChild(name);
+    var qty = el("input", "pr-qty");
+    qty.type = "number";
+    qty.min = "0";
+    qty.step = "any";
+    qty.inputMode = "decimal";
+    qty.value = isNew ? "" : (item.quantity == null ? "" : String(item.quantity));
+    qty.placeholder = "amt";
+    qty.setAttribute("aria-label", "amount left");
+    row.appendChild(qty);
+    var unit = el("input", "pr-unit");
+    unit.value = isNew ? "" : (item.unit || "");
+    unit.placeholder = "unit";
+    row.appendChild(unit);
+    var loc = el("select", "pr-loc");
+    LOCATIONS.forEach(function (L) {
+      var o = document.createElement("option");
+      o.value = L.key;
+      o.textContent = L.label;
+      if ((isNew ? "pantry" : (item.location || "pantry")) === L.key) o.selected = true;
+      loc.appendChild(o);
+    });
+    row.appendChild(loc);
+    var del = el("button", "pr-del", "✕");
+    del.setAttribute("aria-label", "remove item");
+    if (isNew) {
+      del.addEventListener("click", function () { row.remove(); });
+    } else {
+      del.addEventListener("click", function () {
+        if (del.textContent === "✕") { del.textContent = "gone?"; return; }
+        row.classList.add("pr-removing");
+        cmd("pantry_delete", { id: id }, "took " + (item.raw_text || "that item") + " out of the pantry").then(function (res) {
+          row.remove();
+          addNotice(res && res.reply ? res.reply : "Removed from the pantry.");
+        });
+      });
+    }
+    row.appendChild(del);
+    return row;
+  }
+
+  function renderPantry(items) {
+    var view = document.getElementById("pantry-view");
+    view.innerHTML = "";
+    pantryState = items || [];
+    var shown = 0;
+    LOCATIONS.forEach(function (L) {
+      var group = pantryState.filter(function (it) { return (it.location || "pantry") === L.key; });
+      var sec = el("div", "pantry-sec");
+      sec.appendChild(el("h3", "pantry-sec-h", L.label + " (" + group.length + ")"));
+      if (group.length === 0) {
+        sec.appendChild(el("p", "pf-meta", "Nothing here yet."));
+      }
+      group.forEach(function (it) { sec.appendChild(pantryRowHTML(it, false)); shown++; });
+      view.appendChild(sec);
+    });
+    if (shown === 0) {
+      view.appendChild(el("p", "pf-meta", "Your pantry is empty. Tap the camera in the chat and photograph your shelves or a receipt; or add items by hand."));
+    }
+  }
+
+  function loadPantry() {
+    var view = document.getElementById("pantry-view");
+    view.innerHTML = "";
+    view.appendChild(el("p", "pf-meta", "Opening the pantry.."));
+    fetch(CFG.edgeUrl, { headers: { "x-app-token": CFG.appToken } })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { renderPantry(d.pantry || []); })
+      .catch(function () {
+        view.innerHTML = "";
+        view.appendChild(el("p", "pf-meta", "Could not open the pantry just now. Try again in a moment."));
+      });
+  }
+
+  function collectPantryChanges() {
+    var updates = [];
+    document.querySelectorAll("#pantry-view .pantry-row").forEach(function (row) {
+      var id = row.getAttribute("data-id");
+      var orig = JSON.parse(row.getAttribute("data-original") || "{}");
+      var name = row.querySelector(".pr-name").value.trim();
+      var qtyRaw = row.querySelector(".pr-qty").value.trim();
+      var unit = row.querySelector(".pr-unit").value.trim();
+      var loc = row.querySelector(".pr-loc").value;
+      if (!id) {
+        if (name) updates.push({ kind: "add", item: { raw_text: name, quantity: qtyRaw === "" ? null : Number(qtyRaw), unit: unit, location: loc } });
+        return;
+      }
+      var patch = {};
+      if (name !== orig.raw_text) patch.raw_text = name;
+      if (qtyRaw !== orig.quantity) patch.quantity = qtyRaw === "" ? null : Number(qtyRaw);
+      if (unit !== orig.unit) patch.unit = unit;
+      if (loc !== orig.location) patch.location = loc;
+      if (Object.keys(patch).length) updates.push({ kind: "update", id: id, patch: patch, name: name || orig.raw_text });
+    });
+    return updates;
+  }
+
+  var pantrySaveBtn = document.getElementById("pantry-save");
+  var pantryAddBtn = document.getElementById("pantry-add-row");
+  if (pantrySaveBtn) {
+    pantrySaveBtn.addEventListener("click", function () {
+      var updates = collectPantryChanges();
+      if (!updates.length) { addNotice("Nothing changed yet."); return; }
+      pantrySaveBtn.disabled = true;
+      var ops = updates.slice();
+      var run = function () {
+        var op = ops.shift();
+        if (!op) {
+          pantrySaveBtn.disabled = false;
+          sendQueue.then(function () { loadPantry(); });
+          return;
+        }
+        if (op.kind === "add") {
+          cmd("pantry_add", { item: op.item }, "added " + op.item.raw_text + " to the pantry").then(run);
+        } else {
+          cmd("pantry_update", { id: op.id, patch: op.patch }, "updated " + op.name).then(run);
+        }
+      };
+      run();
+    });
+  }
+  if (pantryAddBtn) {
+    pantryAddBtn.addEventListener("click", function () {
+      var view = document.getElementById("pantry-view");
+      var firstSec = view.querySelector(".pantry-sec");
+      if (!firstSec) { loadPantry(); return; }
+      firstSec.appendChild(pantryRowHTML({}, true));
+      var inputs = firstSec.querySelectorAll(".pantry-row:last-child .pr-name");
+      if (inputs.length) inputs[inputs.length - 1].focus();
+    });
+  }
+  var pantryBtn = document.getElementById("quick-pantry");
+  if (pantryBtn) {
+    pantryBtn.addEventListener("click", function () {
+      pantrySheet.hidden = false;
+      loadPantry();
+    });
+  }
+  var pantryClose = document.getElementById("pantry-close");
+  if (pantryClose) pantryClose.addEventListener("click", function () { pantrySheet.hidden = true; });
+  if (pantrySheet) {
+    pantrySheet.addEventListener("click", function (e) { if (e.target === pantrySheet) pantrySheet.hidden = true; });
+  }
+
 })();

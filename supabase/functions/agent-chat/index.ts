@@ -126,7 +126,7 @@ async function callVisionJSON(imageDataUrl: string): Promise<any | null> {
           content: [
             {
               type: "text",
-              text: 'This is a kitchen photo (fridge, pantry shelves, counters) or a grocery receipt. Read it and list every food or drink item you can clearly identify. Ignore brands-only products you cannot name; for receipts list each line item. Return ONLY strict JSON, no prose, no markdown fences: {"items":[{"raw_text":"plain item name, lowercase","quantity":number or null,"unit":"short unit like g|ml|oz|lb|dozen|can|each or null"}]}. No duplicates. If the image shows no identifiable food items, return {"items":[]}.',
+              text: 'This is a kitchen photo (fridge, freezer, pantry shelves, counters, spice rack) or a grocery receipt. Read it and list every food or drink item you can clearly identify. Ignore brands-only products you cannot name; for receipts list each line item. For each item also guess where it lives: "fridge" (needs refrigeration: dairy, meat, fresh produce, leftovers), "freezer" (frozen goods), "seasonings" (spices, herbs, condiments, baking staples like vanilla), or "pantry" (shelf-stable default). Receipts default to "pantry" unless the item clearly needs the fridge or freezer. Return ONLY strict JSON, no prose, no markdown fences: {"items":[{"raw_text":"plain item name, lowercase","quantity":number or null,"unit":"short unit like g|ml|oz|lb|dozen|can|each or null","location":"fridge|freezer|pantry|seasonings"}]}. No duplicates. If the image shows no identifiable food items, return {"items":[]}.',
             },
             { type: "image_url", image_url: { url: imageDataUrl } },
           ],
@@ -236,12 +236,13 @@ async function toolPantryDump(sb: ReturnType<typeof createClient>, items: any[],
         raw_text: i.raw_text.trim(),
         quantity: qty,
         unit_id: unitId,
+        location: ["fridge", "freezer", "pantry", "seasonings"].includes(String(i.location)) ? String(i.location) : "pantry",
         source,
         confirmed: false,
       };
     });
   if (rows.length === 0) return null;
-  const { data, error } = await sb.from("pantry_items").insert(rows).select("id, raw_text, quantity");
+  const { data, error } = await sb.from("pantry_items").insert(rows).select("id, raw_text, quantity, location");
   if (error) throw error;
   return { type: "pantry_review", items: data };
 }
@@ -331,6 +332,70 @@ async function toolSaveIntoSlot(sb: ReturnType<typeof createClient>, label: stri
   await sb.from("kitchen_profiles")
     .upsert({ household_id: householdId, name: slotName, ...currentProfileValues(p), updated_at: new Date().toISOString() }, { onConflict: "household_id,name" });
   return { slot: slotName };
+}
+
+
+function normLocation(v: any): string {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (s === "fridge" || s === "refrigerator") return "fridge";
+  if (s === "freezer" || s === "frozen") return "freezer";
+  if (s === "seasonings" || s === "spices" || s === "seasoning") return "seasonings";
+  return "pantry";
+}
+
+async function toolPantryAdd(sb: ReturnType<typeof createClient>, item: any) {
+  const householdId = await ensureHousehold(sb);
+  const raw = String(item?.raw_text ?? "").trim();
+  if (!raw) return { error: true, message: "What should it say on the label? Give the item a name." };
+  let unitId: string | null = null;
+  if (typeof item?.unit === "string" && item.unit.trim()) {
+    const { data: unitRows } = await sb.from("units").select("id, name, abbreviation, aliases");
+    const lower = item.unit.trim().toLowerCase().replace(/\.$/, "");
+    unitId = (unitRows ?? []).find((u: any) => u.name.toLowerCase() === lower || (u.abbreviation ?? "").toLowerCase() === lower || (Array.isArray(u.aliases) ? u.aliases : []).includes(lower))?.id ?? null;
+  }
+  const qty = (typeof item?.quantity === "number" && isFinite(item.quantity)) ? item.quantity : (String(item?.quantity ?? "").trim() && !isNaN(Number(item.quantity)) ? Number(item.quantity) : null);
+  const { data, error } = await sb.from("pantry_items").insert({
+    household_id: householdId,
+    raw_text: raw,
+    quantity: qty,
+    unit_id: unitId,
+    location: normLocation(item?.location),
+    source: "manual",
+    confirmed: true,
+  }).select("id, raw_text, quantity, location");
+  if (error) throw error;
+  return { type: "pantry_review", items: data };
+}
+
+async function toolPantryUpdate(sb: ReturnType<typeof createClient>, id: string, patch: any) {
+  const householdId = await ensureHousehold(sb);
+  if (!/^[0-9a-f-]{16,}$/i.test(String(id))) return { error: true, message: "That item id does not look right." };
+  const update: Record<string, any> = {};
+  if (patch && typeof patch.raw_text === "string" && patch.raw_text.trim()) update.raw_text = patch.raw_text.trim();
+  if (patch && patch.quantity !== undefined) {
+    const n = Number(patch.quantity);
+    update.quantity = (isFinite(n) && String(patch.quantity).trim() !== "") ? n : null;
+  }
+  if (patch && patch.location !== undefined) update.location = normLocation(patch.location);
+  if (Object.keys(update).length === 0) return { error: true, message: "Nothing to change on that item yet." };
+  const { data, error } = await sb.from("pantry_items")
+    .update({ ...update, confirmed: true })
+    .eq("id", id).eq("household_id", householdId)
+    .select("id, raw_text, quantity, location");
+  if (error) throw error;
+  if (!data || data.length === 0) return { error: true, message: "Could not find that item; it may have been removed already." };
+  return { item: data[0] };
+}
+
+async function toolPantryDelete(sb: ReturnType<typeof createClient>, id: string) {
+  const householdId = await ensureHousehold(sb);
+  if (!/^[0-9a-f-]{16,}$/i.test(String(id))) return { error: true, message: "That item id does not look right." };
+  const { data, error } = await sb.from("pantry_items")
+    .delete().eq("id", id).eq("household_id", householdId)
+    .select("id, raw_text");
+  if (error) throw error;
+  if (!data || data.length === 0) return { error: true, message: "Could not find that item; it may have been removed already." };
+  return { removed: data[0].raw_text };
 }
 
 async function toolSwitchProfile(sb: ReturnType<typeof createClient>, name: string) {
@@ -1101,7 +1166,18 @@ Deno.serve(async (req) => {
     const { data: profileSets } = await sbg.from("kitchen_profiles").select("id, name, household_size, dietary_restrictions, allergies, cuisines_loved, cuisines_avoided, disliked_ingredients, non_negotiables, rhythms, updated_at").eq("household_id", householdId).order("created_at");
     const activeId = (profile && profile[0]) ? profile[0].active_profile_id : null;
     const sets = (profileSets ?? []).map((s: any) => ({ id: s.id, name: s.name, is_current: s.id === activeId }));
+    const { data: pantryRows } = await sbg.from("pantry_items").select("id, raw_text, quantity, location, confirmed, use_by, unit_id, units!unit_id(name, abbreviation)").eq("household_id", householdId).order("raw_text");
+    const pantryItems = (pantryRows ?? []).map((r: any) => ({
+      id: r.id,
+      raw_text: r.raw_text,
+      quantity: r.quantity,
+      unit: r.units?.abbreviation ?? r.units?.name ?? null,
+      location: r.location ?? "pantry",
+      confirmed: r.confirmed ?? false,
+      use_by: r.use_by ?? null,
+    }));
     return new Response(JSON.stringify({
+      pantry: pantryItems,
       profile: profile?.[0] ?? null,
       pantry_count: pantryCount ?? 0,
       recipe_count: recipeCount ?? 0,
@@ -1164,9 +1240,28 @@ Deno.serve(async (req) => {
               cmdReply = "I looked hard at that photo and could not make out any food items. Close-up and decent light help; give it another try.";
               break;
             }
-            const card = await toolPantryDump(sb, items, "photo");
-            if (card) cmdCards.push(card);
+            const scanCard = await toolPantryDump(sb, items, "photo");
+            if (scanCard) cmdCards.push(scanCard);
             cmdReply = `Read ${items.length} item${items.length === 1 ? "" : "s"} off your photo and dropped them into the pantry. Anything that looks off, just tell me and it is gone.`;
+            break;
+          }
+          case "pantry_add": {
+            const addCard = await toolPantryAdd(sb, cmd.item ?? {});
+            if (addCard.error) { cmdCards.push({ type: "notice", text: addCard.message }); break; }
+            cmdCards.push(addCard);
+            cmdReply = "Added to the pantry.";
+            break;
+          }
+          case "pantry_update": {
+            const res = await toolPantryUpdate(sb, String(cmd.id ?? ""), cmd.patch ?? {});
+            if (res.error) { cmdCards.push({ type: "notice", text: res.message }); break; }
+            cmdReply = `Updated: ${res.item.raw_text}.`;
+            break;
+          }
+          case "pantry_delete": {
+            const delRes = await toolPantryDelete(sb, String(cmd.id ?? ""));
+            if (delRes.error) { cmdCards.push({ type: "notice", text: delRes.message }); break; }
+            cmdReply = `Took ${delRes.removed} off the shelf: it is out of the pantry.`;
             break;
           }
           default:

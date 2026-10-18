@@ -1,6 +1,6 @@
 {
-  "name": "Your kitchen (meal prep preview)",
-  "short_name": "Kitchen",
+  "name": "Prep Talk",
+  "short_name": "Prep Talk",
   "description": "Talk it out: your kitchen plans itself. Meal plans, shopping lists, and cook-day guides fall out of the conversation.",
   "start_url": "./",
   "display": "standalone",
