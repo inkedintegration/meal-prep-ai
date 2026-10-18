@@ -12,7 +12,12 @@ const CORS = {
 };
 
 const DEFAULT_MODEL = Deno.env.get("OPENROUTER_MODEL") ?? "deepseek/deepseek-v4.1-flash-1017";
-const FREE_FALLBACK_MODEL = "xingchen-agi/xing4.0-29b-a4b:free";
+const FREE_MODELS = [
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-3.5-lightning:free",
+  "google/gemma-4-31b-it:free",
+  "xingchen-agi/xing4.0-29b-a4b:free",
+];
 const ACCESS_TOKEN = Deno.env.get("APP_ACCESS_TOKEN") ?? "";
 
 function json(body: unknown, status = 200) {
@@ -30,7 +35,7 @@ async function callLLM(messages: { role: string; content: string }[]): Promise<s
   const key = Deno.env.get("OPENROUTER_API_KEY");
   if (!key) throw Object.assign(new Error("missing_key"), { code: "missing_key" });
 
-  const models = [DEFAULT_MODEL, FREE_FALLBACK_MODEL];
+  const models = [DEFAULT_MODEL, ...FREE_MODELS];
   let lastErr: unknown = null;
 
   for (const model of models) {
@@ -54,13 +59,11 @@ async function callLLM(messages: { role: string; content: string }[]): Promise<s
       lastErr = new Error("empty_completion");
       continue;
     }
-    // 402 = no credits, 404 = unknown model, 429 = rate limited: fall through.
-    if (res.status === 402 || res.status === 404 || res.status === 429) {
-      lastErr = new Error(`model_${model}_status_${res.status}`);
-      continue;
-    }
-    const detail = await res.text();
-    throw Object.assign(new Error(`llm_${res.status}: ${detail.slice(0, 300)}`), { code: "llm_error" });
+    // Any failure (402/404/429/5xx): fall through to the next model.
+    let body = "";
+    try { body = await res.text(); } catch { /* keep empty */ }
+    lastErr = new Error(`model_${model}_status_${res.status}: ${body.slice(0, 240)}`);
+    continue;
   }
   throw Object.assign(lastErr ?? new Error("llm_unavailable"), { code: "llm_unavailable" });
 }
@@ -102,16 +105,34 @@ async function ensureProfile(sb: ReturnType<typeof createClient>, householdId: s
 
 async function toolPantryDump(sb: ReturnType<typeof createClient>, items: any[]) {
   const householdId = await ensureHousehold(sb);
+  const { data: unitRows } = await sb.from("units").select("id, name, abbreviation, aliases");
+  const aliasMap = new Map<string, string>();
+  for (const u of unitRows ?? []) {
+    aliasMap.set(u.name.toLowerCase(), u.id);
+    if (u.abbreviation) aliasMap.set(u.abbreviation.toLowerCase(), u.id);
+    for (const a of Array.isArray(u.aliases) ? u.aliases : []) aliasMap.set(String(a).toLowerCase(), u.id);
+  }
   const rows = items
     .filter((i) => i && typeof i.raw_text === "string" && i.raw_text.trim())
     .slice(0, 60)
-    .map((i) => ({
-      household_id: householdId,
-      raw_text: i.raw_text.trim(),
-      quantity: typeof i.quantity === "number" ? i.quantity : null,
-      source: "brain-dump",
-      confirmed: false,
-    }));
+    .map((i) => {
+      let unitId: string | null = null;
+      if (typeof i.unit === "string" && i.unit.trim()) {
+        const key = i.unit.trim().toLowerCase().replace(/\.+$/, "");
+        unitId = aliasMap.get(key) ?? null;
+      }
+      let qty: number | null = null;
+      if (typeof i.quantity === "number" && isFinite(i.quantity)) qty = i.quantity;
+      else if (typeof i.quantity === "string" && i.quantity.trim() && !isNaN(Number(i.quantity))) qty = Number(i.quantity);
+      return {
+        household_id: householdId,
+        raw_text: i.raw_text.trim(),
+        quantity: qty,
+        unit_id: unitId,
+        source: "brain-dump",
+        confirmed: false,
+      };
+    });
   if (rows.length === 0) return null;
   const { data, error } = await sb.from("pantry_items").insert(rows).select("id, raw_text, quantity");
   if (error) throw error;
@@ -378,10 +399,20 @@ Deno.serve(async (req) => {
   try {
     let parsed: any = null;
     try {
-      const out = await callLLM([
-        { role: "system", content: SYSTEM },
-        { role: "user", content: userText },
-      ]);
+      let out: string | null = null;
+      try {
+        out = await callLLM([
+          { role: "system", content: SYSTEM },
+          { role: "user", content: userText },
+        ]);
+      } catch (llmErr: any) {
+        if (llmErr?.code === "missing_key") throw llmErr;
+        await new Promise((r) => setTimeout(r, 4000));
+        out = await callLLM([
+          { role: "system", content: SYSTEM },
+          { role: "user", content: userText },
+        ]);
+      }
       parsed = parseJsonLoose(out);
     } catch (e: any) {
       if (e?.code === "missing_key") {
@@ -457,6 +488,9 @@ Deno.serve(async (req) => {
     return json({ reply: finalReply, cards });
   } catch (e: any) {
     console.error("agent-chat error", e?.message ?? e);
-    return fail("Something broke in the kitchen. The details are in the function logs.", "server_error", 500);
+    const msg = e?.code === "llm_unavailable"
+      ? "The chef brain is rate-limited right now. Give it a minute and send that again."
+      : "Something broke in the kitchen. Try again in a minute; if it keeps happening, Juno is on it.";
+    return json({ error: "server_error", message: msg, detail: String(e?.message ?? e).slice(0, 200) }, 503);
   }
 });
