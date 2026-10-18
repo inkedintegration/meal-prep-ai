@@ -31,35 +31,75 @@ function fail(message: string, code = "error", status = 400) {
   return json({ error: code, message }, status);
 }
 
-async function callLLM(messages: { role: string; content: string }[]): Promise<string> {
+async function callLLM(messages: { role: string; content: string }[], maxTokens = 3000): Promise<string> {
   const key = Deno.env.get("OPENROUTER_API_KEY");
   if (!key) throw Object.assign(new Error("missing_key"), { code: "missing_key" });
 
   const models = [DEFAULT_MODEL, ...FREE_MODELS];
+  const deadline = Date.now() + 190000;
   let lastErr: unknown = null;
 
   for (const model of models) {
-    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        max_tokens: 3000,
-        temperature: 0.3,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const text: string | undefined = data?.choices?.[0]?.message?.content;
-      if (typeof text === "string" && text.trim()) return text;
-      lastErr = new Error("empty_completion");
+    if (Date.now() > deadline) break;
+    let res: Response;
+    try {
+      res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        // Streaming: chunks keep the edge worker alive on long generations.
+        body: JSON.stringify({
+          model,
+          messages,
+          max_tokens: maxTokens,
+          temperature: 0.3,
+          reasoning: { enabled: false },
+          stream: true,
+        }),
+        signal: AbortSignal.timeout(75000),
+      });
+    } catch {
+      lastErr = new Error(`model_${model}_timeout_or_network`);
       continue;
     }
-    // Any failure (402/404/429/5xx): fall through to the next model.
+    if (res.ok && res.body) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let out = "";
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, idx).trim();
+            buf = buf.slice(idx + 1);
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === "[DONE]") continue;
+            try {
+              const j = JSON.parse(payload);
+              const piece = j?.choices?.[0]?.delta?.content;
+              if (typeof piece === "string") out += piece;
+            } catch {
+              // ignore keep-alive comment lines
+            }
+          }
+        }
+      } catch (e: any) {
+        lastErr = new Error(`model_${model}_stream_error: ${String(e?.message ?? e).slice(0, 120)}`);
+        if (out.trim()) return out; // partial output beats nothing
+        continue;
+      }
+      if (typeof out === "string" && out.trim()) return out;
+      lastErr = new Error(`model_${model}_empty_stream`);
+      continue;
+    }
+    // Any failure (402/404/429/5xx): capture the body, fall through to the next model.
     let body = "";
     try { body = await res.text(); } catch { /* keep empty */ }
     lastErr = new Error(`model_${model}_status_${res.status}: ${body.slice(0, 240)}`);
@@ -364,6 +404,7 @@ const SYSTEM = `You parse one message from a person preparing their meals for th
   {"type": "profile", "patch": {"household_size": int_or_absent, "rhythms": [{"kind": "weekly"|"biweekly"|"monthly", "subject": "short label", "detail": "one line"}]}},
   {"type": "week_context", "constraints": [{"day": "monday|tuesday|...|sunday", "note": "short note"}]},
   {"type": "import_recipe", "url": "..."},
+  {"type": "find_recipes", "query": "dish or ingredient keyword", "count": int_1_to_6},
   {"type": "plan_week"}
  ]}
 Rules:
@@ -371,9 +412,503 @@ Rules:
 - pantry: food they HAVE (pantry/fridge/freezer/shopping haul). Never invent units or quantities they did not state.
 - profile: standing facts only: household_size, dietary_restrictions[], allergies[], cuisines_loved[], cuisines_avoided[], disliked_ingredients[], rhythms (recurring habits like "pasta once a week", "crockpot every two weeks", "leftovers become weekend lunches").
 - week_context: constraints for THIS week only (sports, classes, late nights): day + short note.
+- find_recipes: when they ask you to find/pull/suggest recipes ("pull pasta recipes", "find me something with chicken"). query = short keyword; count = how many (default 3).
 - plan_week: when they want the week planned, explicitly or clearly implied.
 - reply: acknowledge what you caught; warm, human, brief; never mention being an AI.`;
 
+// ---------- milestone 3: the one-tap week ----------
+// The planner gets EVERYTHING the kitchen already knows: pantry, profile + rhythms,
+// this week's constraints, and the recipe vault. One planning LLM call, then the
+// server validates and writes: week entries, gap-list shopping items, prep sessions.
+
+const PLANNER_SYSTEM = `You are the meal-planning brain of a home kitchen app.
+You receive: the household taste profile (with standing rhythms), pantry inventory, this week's constraints, and the recipe vault.
+Return STRICT JSON only:
+{
+  "reply": "1-2 warm sentences summarizing the week",
+  "days": [
+    {"day": "monday", "meals": [
+      {"slot": "dinner", "recipe_id": "<uuid from vault or null>", "title": "meal name", "servings": 4, "note": "why this works tonight"}
+    ]}
+  ],
+  "shopping_list": [
+    {"raw_text": "exact ingredient with quantity", "quantity": 2, "unit": "lb", "aisle": "produce", "from": "which meal needs it", "have_it": false}
+  ],
+  "prep_sessions": [
+    {"day": "sunday", "focus": "short label", "tasks": [{"text": "imperative task", "minutes": 20, "kind": "active"}]}
+  ]
+}
+RULES:
+- days: monday..sunday only, all seven, exactly one dinner per day (plus a lunch or breakfast slot when rhythms imply it).
+- recipe_id MUST be a uuid copied from the vault when the meal comes from a saved recipe; use null for simple pantry meals and still give a title.
+- Honor week constraints: sports/late-class nights get quick or hands-off meals (crockpot, leftovers, 20-minute dinners).
+- Honor rhythms: pasta once a week; crockpot every 2 weeks; leftovers become weekend lunches when the profile says so.
+- When the rhythms include leftovers for lunches, add saturday and sunday lunch entries that reuse earlier dinners; mark them in the note.
+- Respect dietary restrictions as HARD filters; never plan an allergy. Avoid disliked ingredients and avoided cuisines.
+- Use the pantry first; mark shopping_list items the pantry already covers with "have_it": true.
+- shopping_list = the GAP only: what must be bought. Merge duplicates. Copy quantities/units from recipes; never invent units.
+- prep_sessions: 1-2 sessions max (a real cook day plus maybe a quick midweek session). Tasks ordered, concrete, with rough minutes.
+- Servings scale to the household size. Keep it calm and doable, not ambitious.`;
+
+async function fetchWeekContext(sb: ReturnType<typeof createClient>, householdId: string) {
+  const weekOf = mondayOfCurrentWeek();
+  const [profileRes, pantryRes, planRes, recipesRes] = await Promise.all([
+    sb.from("taste_profiles").select("*").eq("household_id", householdId).limit(1),
+    sb.from("pantry_items").select("raw_text, quantity, confirmed, unit_id").eq("household_id", householdId).order("added_at", { ascending: false }).limit(40),
+    sb.from("week_plans").select("id, constraints").eq("household_id", householdId).eq("week_of", weekOf).limit(1),
+    sb.from("recipes").select("id, title, servings, quality_score").eq("household_id", householdId).limit(30),
+  ]);
+  const profile = profileRes.data?.[0] ?? null;
+  const pantry = pantryRes.data ?? [];
+  const plan = planRes.data?.[0] ?? null;
+  const recipes = recipesRes.data ?? [];
+  // Ingredient lines per recipe (for gap math + planner context)
+  const ingByRecipe: Record<string, string[]> = {};
+  if (recipes.length) {
+    const { data: ings } = await sb.from("recipe_ingredients").select("recipe_id, raw_text").in("recipe_id", recipes.map((r: any) => r.id));
+    for (const i of ings ?? []) {
+      (ingByRecipe[i.recipe_id] ??= []).push(i.raw_text);
+    }
+  }
+  return { weekOf, profile, pantry, plan, recipes, ingByRecipe };
+}
+
+function pantryLine(p: any, unitName: string | null): string {
+  const qty = p.quantity != null ? `${p.quantity} ` : "";
+  return `${qty}${p.raw_text}${unitName ? ` (${unitName})` : ""}`;
+}
+
+async function toolPlanWeek(sb: ReturnType<typeof createClient>, userNote: string) {
+  const householdId = await ensureHousehold(sb);
+  const ctx = await fetchWeekContext(sb, householdId);
+
+  const pantryText = ctx.pantry.map((p: any) => pantryLine(p, null)).join("; ") || "(empty)";
+  const recipeLines = ctx.recipes.map((r: any) =>
+    `- id ${r.id} | "${r.title}" | serves ${r.servings ?? "?"} | chef score ${r.quality_score ?? "unrated"} | needs: ${(ctx.ingByRecipe[r.id] ?? []).slice(0, 12).join("; ")}`
+  ).join("\n") || "(vault is empty: plan simple pantry meals and say the vault needs recipes)";
+  const constraintText = (ctx.plan?.constraints ?? []).map((c: any) => `${c.day}: ${c.note}`).join("; ") || "(none)";
+  const rhythmText = (ctx.profile?.rhythms ?? []).map((r: any) => `${r.subject} ${r.kind}${r.detail ? ` (${r.detail})` : ""}`).join("; ") || "(none)";
+  const profileText = [
+    ctx.profile?.household_size ? `household of ${ctx.profile.household_size}` : null,
+    (ctx.profile?.dietary_restrictions ?? []).length ? `restrictions: ${ctx.profile.dietary_restrictions.join(", ")}` : null,
+    (ctx.profile?.allergies ?? []).length ? `allergies: ${ctx.profile.allergies.join(", ")}` : null,
+    (ctx.profile?.cuisines_loved ?? []).length ? `loves: ${ctx.profile.cuisines_loved.join(", ")}` : null,
+    (ctx.profile?.cuisines_avoided ?? []).length ? `avoids: ${ctx.profile.cuisines_avoided.join(", ")}` : null,
+    (ctx.profile?.disliked_ingredients ?? []).length ? `dislikes: ${ctx.profile.disliked_ingredients.join(", ")}` : null,
+    ctx.profile?.time_budget_minutes ? `${ctx.profile.time_budget_minutes} min cook budget` : null,
+    ctx.profile?.notes ? `notes: ${ctx.profile.notes}` : null,
+  ].filter(Boolean).join(" | ") || "(no profile yet)";
+
+  const userBlock = `TASTE PROFILE: ${profileText}
+STANDING RHYTHMS: ${rhythmText}
+PANTRY: ${pantryText}
+THIS WEEK'S CONSTRAINTS: ${constraintText}
+RECIPE VAULT:
+${recipeLines}
+HOUSEHOLD'S PLANNING NOTE: ${userNote || "(just plan the week)"}`;
+
+  let rawOut: string | null = null;
+  try {
+    rawOut = await callLLM([
+      { role: "system", content: PLANNER_SYSTEM },
+      { role: "user", content: userBlock },
+    ], 3800);
+  } catch (e: any) {
+    if (e?.code === "missing_key") throw e;
+    return { error: true, message: "The planning model is busy right now. Try again in a minute; your week context is saved." };
+  }
+  let parsed = parseJsonLoose(rawOut);
+  if (!parsed || !Array.isArray(parsed.days)) {
+    // one honest retry after a short pause
+    await new Promise((r) => setTimeout(r, 4000));
+    try {
+      rawOut = await callLLM([
+        { role: "system", content: PLANNER_SYSTEM },
+        { role: "user", content: userBlock + "\n\nReminder: reply ONLY with the JSON object. No prose before or after." },
+      ], 3800);
+    } catch {
+      // fall through to the mangled notice
+    }
+  }
+  parsed = parseJsonLoose(rawOut);
+  if (!parsed || !Array.isArray(parsed.days)) {
+    return { error: true, message: "The plan came back mangled. Try again in a minute." };
+  }
+
+  const DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+  const recipeById = new Map<string, any>(ctx.recipes.map((r: any) => [r.id, r]));
+  const recipeByTitle = new Map<string, any>(ctx.recipes.map((r: any) => [String(r.title).toLowerCase(), r]));
+
+  // Validate days
+  const seenDays = new Set<string>();
+  const dayRows: { day: string; meals: any[] }[] = [];
+  for (const d of parsed.days.slice(0, 7)) {
+    if (!d || typeof d.day !== "string") continue;
+    const day = DAYS.find((x) => x === d.day.trim().toLowerCase());
+    if (!day || seenDays.has(day)) continue;
+    seenDays.add(day);
+    const meals = (Array.isArray(d.meals) ? d.meals : []).slice(0, 3).map((m: any) => {
+      let recipeId: string | null = null;
+      if (typeof m?.recipe_id === "string" && recipeById.has(m.recipe_id)) recipeId = m.recipe_id;
+      else if (typeof m?.title === "string" && recipeByTitle.has(m.title.trim().toLowerCase())) recipeId = recipeByTitle.get(m.title.trim().toLowerCase()).id;
+      let servings = Number(m?.servings);
+      if (!Number.isFinite(servings)) servings = ctx.profile?.household_size ?? 2;
+      servings = Math.min(12, Math.max(1, servings));
+      return {
+        slot: typeof m?.slot === "string" ? m.slot.trim().toLowerCase().slice(0, 16) : "dinner",
+        recipe_id: recipeId,
+        title: typeof m?.title === "string" ? m.title.trim().slice(0, 120) : "Simple dinner",
+        servings,
+        notes: typeof m?.note === "string" ? m.note.trim().slice(0, 200) : null,
+      };
+    });
+    if (meals.length) dayRows.push({ day, meals });
+  }
+  if (dayRows.length === 0) {
+    return { error: true, message: "The plan came back empty. Try again in a minute." };
+  }
+
+  // Validate shopping items: keep the GAP only
+  const pantryBlob = ctx.pantry.map((p: any) => String(p.raw_text).toLowerCase()).join(" | ");
+  const seenItem = new Set<string>();
+  const listItems: any[] = [];
+  for (const it of (Array.isArray(parsed.shopping_list) ? parsed.shopping_list : []).slice(0, 40)) {
+    if (!it || typeof it.raw_text !== "string" || !it.raw_text.trim()) continue;
+    if (it.have_it === true) continue;
+    const text = it.raw_text.trim().slice(0, 120);
+    const key = text.toLowerCase().replace(/[^a-z0-9 ]/g, "");
+    if (seenItem.has(key)) continue;
+    // second pantry check: exact word containment of a pantry raw_text
+    const covered = ctx.pantry.some((p: any) => {
+      const pn = String(p.raw_text).toLowerCase().trim();
+      return pn.length > 2 && (key.includes(pn) || pn.includes(key.split(" ")[0] ?? "\u0000"));
+    });
+    if (covered) continue;
+    seenItem.add(key);
+    let qty: number | null = null;
+    if (typeof it.quantity === "number" && isFinite(it.quantity)) qty = it.quantity;
+    else if (typeof it.quantity === "string" && it.quantity.trim() && !isNaN(Number(it.quantity))) qty = Number(it.quantity);
+    listItems.push({
+      raw_text: text,
+      quantity: qty,
+      unit_text: typeof it.unit === "string" ? it.unit.trim() : null,
+      aisle: typeof it.aisle === "string" ? it.aisle.trim().slice(0, 40) : null,
+      from: typeof it.from === "string" ? it.from.trim().slice(0, 80) : null,
+    });
+  }
+
+  // Validate prep sessions
+  const sessions: { day: string; focus: string; tasks: { text: string; minutes: number | null; kind: string }[] }[] = [];
+  for (const s of (Array.isArray(parsed.prep_sessions) ? parsed.prep_sessions : []).slice(0, 3)) {
+    if (!s || typeof s.day !== "string") continue;
+    const day = DAYS.find((x) => x === s.day.trim().toLowerCase());
+    if (!day) continue;
+    const tasks = (Array.isArray(s.tasks) ? s.tasks : []).slice(0, 14).map((t: any) => ({
+      text: typeof t?.text === "string" ? t.text.trim().slice(0, 200) : "",
+      minutes: Number.isFinite(Number(t?.minutes)) ? Math.min(180, Math.max(0, Number(t.minutes))) : null,
+      kind: t?.kind === "passive" ? "passive" : "active",
+    })).filter((t) => t.text);
+    if (!tasks.length) continue;
+    sessions.push({ day, focus: typeof s.focus === "string" ? s.focus.trim().slice(0, 60) : "cook day", tasks });
+  }
+
+  // ---- writes ----
+  let planId = ctx.plan?.id as string | undefined;
+  if (!planId) {
+    const { data: createdPlan, error } = await sb.from("week_plans").insert({ household_id: householdId, week_of: ctx.weekOf, constraints: ctx.plan?.constraints ?? [] }).select("id").single();
+    if (error) throw error;
+    planId = createdPlan.id;
+  }
+  // Re-plan replaces the previous draft
+  await sb.from("week_plan_entries").delete().eq("week_plan_id", planId);
+  await sb.from("shopping_lists").delete().eq("week_plan_id", planId);
+  await sb.from("prep_sessions").delete().eq("week_plan_id", planId);
+
+  const entryRows = dayRows.flatMap((d) => d.meals.map((m) => ({
+    week_plan_id: planId,
+    recipe_id: m.recipe_id,
+    day_hint: d.day,
+    meal_slot: m.slot,
+    servings: m.servings,
+    notes: m.notes,
+  })));
+  if (entryRows.length) {
+    const { error } = await sb.from("week_plan_entries").insert(entryRows);
+    if (error) throw error;
+  }
+
+  // Shopping list (resolve units)
+  const { data: unitRows } = await sb.from("units").select("id, name, abbreviation, aliases");
+  const aliasMap = new Map<string, string>();
+  for (const u of unitRows ?? []) {
+    aliasMap.set(u.name.toLowerCase(), u.id);
+    if (u.abbreviation) aliasMap.set(u.abbreviation.toLowerCase(), u.id);
+    for (const a of Array.isArray(u.aliases) ? u.aliases : []) aliasMap.set(String(a).toLowerCase(), u.id);
+  }
+  const listRows = listItems.map((it) => ({
+    shopping_list_id: null as string | null,
+    raw_text: it.raw_text,
+    quantity: it.quantity,
+    unit_id: it.unit_text ? (aliasMap.get(it.unit_text.toLowerCase().replace(/\.+$/, "")) ?? null) : null,
+    aisle: it.aisle,
+    provenance: it.from ? [{ from: it.from }] : [],
+  }));
+  let listCard: any = { type: "shopping_list", items: [], skipped_have: 0 };
+  if (listRows.length) {
+    const { data: createdList, error } = await sb.from("shopping_lists").insert({ household_id: householdId, week_plan_id: planId }).select("id").single();
+    if (error) throw error;
+    const { data: savedItems, error: liErr } = await sb.from("shopping_list_items").insert(listRows.map((r) => ({ ...r, shopping_list_id: createdList.id }))).select("id, raw_text, quantity");
+    if (liErr) throw liErr;
+    listCard = { type: "shopping_list", items: savedItems, skipped_have: (Array.isArray(parsed.shopping_list) ? parsed.shopping_list : []).filter((x: any) => x?.have_it === true).length };
+  }
+
+  // Prep sessions + tasks
+  const sessionCards: any[] = [];
+  for (const s of sessions) {
+    const dayIndex = DAYS.indexOf(s.day);
+    const date = new Date(ctx.weekOf + "T12:00:00Z");
+    date.setUTCDate(date.getUTCDate() + dayIndex);
+    const { data: sess, error } = await sb.from("prep_sessions").insert({ household_id: householdId, week_plan_id: planId, scheduled_for: date.toISOString().slice(0, 10) }).select("id").single();
+    if (error) throw error;
+    const { data: savedTasks, error: tErr } = await sb.from("prep_tasks").insert(s.tasks.map((t, idx) => ({
+      prep_session_id: sess.id,
+      text: t.text,
+      kind: t.kind,
+      minutes: t.minutes,
+      order_index: idx,
+    }))).select("id, text, minutes, kind, order_index");
+    if (tErr) throw tErr;
+    sessionCards.push({ type: "cook_guide", day: s.day, focus: s.focus, tasks: savedTasks });
+  }
+
+  // Card: week plan (from what we wrote)
+  const recipeTitles = new Map(ctx.recipes.map((r: any) => [r.id, r.title]));
+  const weekCard = {
+    type: "week_plan",
+    week_of: ctx.weekOf,
+    days: dayRows.map((d) => ({
+      day: d.day,
+      meals: d.meals.map((m) => ({
+        slot: m.slot,
+        title: m.recipe_id ? recipeTitles.get(m.recipe_id) ?? m.title : m.title,
+        servings: m.servings,
+        note: m.notes,
+        from_vault: Boolean(m.recipe_id),
+      })),
+    })),
+  };
+
+  let reply = typeof parsed.reply === "string" && parsed.reply.trim() ? parsed.reply.trim() : "Here is your week.";
+  if (dayRows.length >= 5 && /don.t have|do not have|tell me what/i.test(reply)) {
+    reply = "Here's your week, built from your pantry, your rhythms, and this week's schedule.";
+  }
+  return { error: false, cards: [weekCard, listCard, ...sessionCards], reply };
+}
+// ---------- discovery: find recipes from the web, chef-gated ----------
+// Free source: TheMealDB public API (no key). Attribution + linkback always.
+// Hard filters: allergies and disliked ingredients reject BEFORE scoring.
+
+const DISCOVERY_SYSTEM = `You are a chef curating recipe candidates for a household. You receive the household profile and candidate recipes (title, ingredients, steps). Return STRICT JSON only:
+{"scores": [{"index": 0, "score": 0-100, "verdict": "accept"|"reject", "notes": ["one short note"], "fit": "one short line on why it fits this household"}]}
+Rules:
+- score = your honest chef judgment: method soundness, sane quantities, clarity, ingredient realism (0-100).
+- verdict = "reject" if method is incoherent, quantities are absurd, or it cannot be a real dinner.
+- notes: max 3, short, specific. fit: mention how it matches (or misses) the profile's cuisines and rhythms.`;
+
+function mealDbLine(ing: unknown, meas: unknown): string | null {
+  const i = String(ing ?? "").trim();
+  const m = String(meas ?? "").trim();
+  if (!i || i.toLowerCase() === "null") return null;
+  return `${m ? m + " " : ""}${i}`.trim();
+}
+
+function allergiesHit(haystack: string, needles: string[]): string | null {
+  const h = haystack.toLowerCase();
+  for (const n of needles) {
+    const term = String(n).toLowerCase().trim();
+    if (term.length > 2 && h.includes(term)) return n;
+  }
+  return null;
+}
+
+async function toolFindRecipes(sb: ReturnType<typeof createClient>, query: string, count: number) {
+  const householdId = await ensureHousehold(sb);
+  const { data: profileRow } = await sb.from("taste_profiles").select("*").eq("household_id", householdId).limit(1);
+  const profile = profileRow?.[0] ?? null;
+  const allergies = (profile?.allergies ?? []).map(String);
+  const disliked = (profile?.disliked_ingredients ?? []).map(String);
+  const restrictions = (profile?.dietary_restrictions ?? []).map(String).map((s: string) => s.toLowerCase());
+
+  const q = query.trim().slice(0, 60);
+  const want = Math.min(6, Math.max(1, Number(count) || 3));
+  const searchUrl = `https://www.themealdb.com/api/json/v1/1/search.php?s=${encodeURIComponent(q)}`;
+  let meals: any[] = [];
+  try {
+    const res = await fetch(searchUrl, { signal: AbortSignal.timeout(20000) });
+    if (res.ok) {
+      const data = await res.json();
+      meals = Array.isArray(data?.meals) ? data.meals : [];
+    }
+  } catch {
+    // fall through to ingredient filter
+  }
+  if (meals.length < 3) {
+    // thin results: merge in by-ingredient matches (dedupe by idMeal)
+    const ing = q.split(/[ ,]+/)[0] ?? "";
+    if (ing) {
+      try {
+        const res2 = await fetch(`https://www.themealdb.com/api/json/v1/1/filter.php?i=${encodeURIComponent(ing)}`, { signal: AbortSignal.timeout(20000) });
+        if (res2.ok) {
+          const data2 = await res2.json();
+          const have = new Set(meals.map((m: any) => m.idMeal));
+          const ids: string[] = (data2?.meals ?? []).map((m: any) => m.idMeal).filter((id: string) => !have.has(id));
+          for (const id of ids.slice(0, 8 - meals.length)) {
+            try {
+              const detailRes = await fetch(`https://www.themealdb.com/api/json/v1/1/lookup.php?i=${id}`, { signal: AbortSignal.timeout(20000) });
+              if (!detailRes.ok) continue;
+              const d2 = await detailRes.json();
+              if (Array.isArray(d2?.meals) && d2.meals[0]) meals.push(d2.meals[0]);
+            } catch {
+              // skip this one
+            }
+          }
+        }
+      } catch {
+        // stay with what we have
+      }
+    }
+  }
+  if (meals.length === 0) {
+    return { error: false, cards: [{ type: "notice", text: `Nothing surfaced for "${q}". Try another word: an ingredient or a dish.` }], reply: `Nothing surfaced for "${q}" yet.` };
+  }
+
+  // Shape candidates; hard-filter allergies/dislikes BEFORE spending a scoring call.
+  const { data: existingRows } = await sb.from("recipes").select("title, source_url").eq("household_id", householdId);
+  const existingTitles = new Set((existingRows ?? []).map((r: any) => String(r.title).toLowerCase()));
+  const candidates: any[] = [];
+  for (const m of meals) {
+    if (candidates.length >= Math.min(6, want + 2)) break;
+    const ingredientLines: string[] = [];
+    for (let i = 1; i <= 20; i++) {
+      const line = mealDbLine(m[`strIngredient${i}`], m[`strMeasure${i}`]);
+      if (line) ingredientLines.push(line);
+    }
+    const steps = String(m.strInstructions ?? "").split(/\r?\n+/).map((s: string) => s.trim()).filter(Boolean);
+    const title = String(m.strMeal ?? "").trim();
+    if (!title || existingTitles.has(title.toLowerCase())) continue;
+    const blob = (ingredientLines.join(" ") + " " + title).toLowerCase();
+    const hit = allergiesHit(blob, [...allergies, ...disliked]);
+    if (hit) continue;
+    if (restrictions.some((r: string) => (r === "vegetarian" || r === "vegan") && /chicken|beef|pork|bacon|sausage|steak|turkey|lamb|shrimp|fish|salmon|tuna/.test(blob))) continue;
+    if (restrictions.some((r: string) => r === "halal" && /pork|bacon|wine|beer|rum|whiskey/.test(blob))) continue;
+    if (restrictions.some((r: string) => r === "kosher" && /pork|bacon|shellfish|shrimp|crab|lobster/.test(blob))) continue;
+    candidates.push({
+      idMeal: m.idMeal,
+      title,
+      category: m.strCategory ?? null,
+      cuisine: m.strArea ?? null,
+      image: m.strMealThumb ?? null,
+      sourceUrl: (typeof m.strSource === "string" && m.strSource.trim()) ? m.strSource.trim() : `https://www.themealdb.com/meal/${m.idMeal}`,
+      servings: profile?.household_size ?? 4,
+      ingredientLines,
+      steps,
+    });
+  }
+  if (candidates.length === 0) {
+    return { error: false, cards: [{ type: "notice", text: `Found ${meals.length} for "${q}" but none fit your kitchen's rules (allergies and dislikes are hard lines). Want a different direction?` }], reply: `Nothing fit your kitchen's rules for "${q}"; your lines held. Want me to try another direction?` };
+  }
+
+  // One batched scoring call
+  const profileText = [
+    profile?.household_size ? `household of ${profile.household_size}` : null,
+    (profile?.cuisines_loved ?? []).length ? `loves: ${profile.cuisines_loved.join(", ")}` : null,
+    (profile?.cuisines_avoided ?? []).length ? `avoids: ${profile.cuisines_avoided.join(", ")}` : null,
+    (profile?.rhythms ?? []).length ? `rhythms: ${profile.rhythms.map((r: any) => r.subject).join(", ")}` : null,
+  ].filter(Boolean).join(" | ") || "(none yet)";
+  const candBlock = candidates.map((c, i) => `[${i}] "${c.title}" (${c.cuisine ?? "?"} ${c.category ?? ""})
+ingredients: ${c.ingredientLines.slice(0, 12).join("; ")}
+steps: ${c.steps.slice(0, 4).map((s: string) => s.slice(0, 100)).join(" | ")}`).join("\n\n");
+  let scores: any[] = [];
+  try {
+    const out = await callLLM([
+      { role: "system", content: DISCOVERY_SYSTEM },
+      { role: "user", content: `HOUSEHOLD: ${profileText}\n\nCANDIDATES:\n${candBlock}` },
+    ], 1800);
+    const parsed = parseJsonLoose(out);
+    if (parsed && Array.isArray(parsed.scores)) scores = parsed.scores;
+  } catch {
+    // scoring unavailable: save un-scored, honestly
+  }
+
+  const byIndex = new Map<number, any>();
+  for (const s of scores) {
+    const i = Number(s?.index);
+    if (Number.isInteger(i)) byIndex.set(i, s);
+  }
+
+  const keepers = candidates
+    .map((c, i) => ({ c, s: byIndex.get(i) }))
+    .filter(({ s }) => !s || (s.verdict !== "reject" && Number(s.score) >= 55))
+    .sort((a, b) => (Number(b.s?.score) || 0) - (Number(a.s?.score) || 0))
+    .slice(0, want);
+
+  if (keepers.length === 0) {
+    return { error: false, cards: [{ type: "notice", text: `The chef looked at the "${q}" options and none passed the rubric. Want a different direction?` }], reply: `None of the "${q}" options passed the chef rubric. Want a different direction?` };
+  }
+
+  // Save keepers + build cards
+  const cards: any[] = [];
+  for (const { c, s } of keepers) {
+    const attribution = `TheMealDB · ${c.title}`;
+    const { data: saved, error } = await sb.from("recipes").insert({
+      household_id: householdId,
+      title: c.title,
+      servings: c.servings,
+      cuisine: c.cuisine ?? "",
+      image_url: c.image,
+      source_url: c.sourceUrl,
+      attribution,
+      quality_score: s ? Math.max(0, Math.min(100, Math.round(Number(s.score)))) : null,
+      quality_notes: s && Array.isArray(s.notes) ? s.notes.map(String).slice(0, 5) : [],
+      status: "imported",
+    }).select("id").single();
+    if (error) continue;
+    if (c.ingredientLines.length) {
+      await sb.from("recipe_ingredients").insert(c.ingredientLines.map((t: string, idx: number) => ({
+        recipe_id: saved.id,
+        raw_text: t,
+        position: idx,
+      })));
+    }
+    if (c.steps.length) {
+      await sb.from("recipe_steps").insert(c.steps.map((t: string, idx: number) => ({
+        recipe_id: saved.id,
+        position: idx,
+        text: t,
+        kind: "active",
+      })));
+    }
+    cards.push({
+      type: "recipe",
+      recipe: {
+        title: c.title,
+        quality_score: s ? Math.round(Number(s.score)) : null,
+        quality_notes: s && Array.isArray(s.notes) ? s.notes.map(String).slice(0, 3) : [],
+        ingredients_count: c.ingredientLines.length,
+        steps_count: c.steps.length,
+        servings: c.servings,
+        source_url: c.sourceUrl,
+        attribution,
+        fit: s?.fit ?? null,
+      },
+    });
+  }
+  if (cards.length === 0) {
+    return { error: false, cards: [{ type: "notice", text: `The "${q}" picks saved with a hiccup. Try again?` }], reply: "The picks hiccuped on save. Try again?" };
+  }
+  const reply = `Pulled ${cards.length} for "${q}", chef-scored against your kitchen. Tap a card for the source.`;
+  return { error: false, cards, reply };
+}
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
   if (req.method !== "POST") return fail("POST only", "bad_method", 405);
@@ -439,7 +974,7 @@ Deno.serve(async (req) => {
       ? parsed.reply.trim()
       : "Right there with you.";
     const cards: any[] = [];
-    let planMentioned = false;
+    let finalReply = replyText;
 
     for (const part of parts.slice(0, 6)) {
       try {
@@ -466,9 +1001,16 @@ Deno.serve(async (req) => {
             else cards.push(result);
             break;
           }
+          case "find_recipes": {
+            const found = await toolFindRecipes(sb, typeof part.query === "string" ? part.query : userText, Number(part.count) || 3);
+            if (found.error) cards.push({ type: "notice", text: found.message ?? "Search hiccuped." });
+            else { cards.push(...found.cards); finalReply = found.reply; }
+            break;
+          }
           case "plan_week": {
-            planMentioned = true;
-            cards.push({ type: "plan_stub" });
+            const planResult = await toolPlanWeek(sb, typeof part.notes === "string" ? part.notes : userText);
+            if (planResult.error) cards.push({ type: "notice", text: planResult.message });
+            else { cards.push(...planResult.cards); finalReply = planResult.reply; }
             break;
           }
           default:
@@ -476,14 +1018,10 @@ Deno.serve(async (req) => {
         }
       } catch (e: any) {
         console.error("part failed", part?.type, e?.message ?? e);
-        cards.push({ type: "notice", text: "One part of that did not land. The rest is saved." });
+        cards.push({ type: "notice", text: "The " + (part?.type ?? "unknown") + " part did not land (" + String(e?.message ?? e).slice(0, 140) + "). The rest is saved." });
       }
     }
 
-    let finalReply = replyText;
-    if (planMentioned) {
-      finalReply += " The one-tap week lands in milestone 3; your week notes are already kept.";
-    }
 
     return json({ reply: finalReply, cards });
   } catch (e: any) {

@@ -4,6 +4,7 @@
   var thread = document.getElementById("thread");
   var draft = document.getElementById("draft");
   var sendBtn = document.getElementById("send");
+  var quickBtn = document.getElementById("quick-plan");
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -11,6 +12,7 @@
     if (text) n.textContent = text;
     return n;
   }
+  function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
 
   function addBubble(role, text) {
     var b = el("div", "bubble " + role, text);
@@ -60,9 +62,37 @@
       c.appendChild(el("p", "meta", "Kept with the plan:"));
       var wl = el("ul");
       card.constraints.forEach(function (ct) {
-        wl.appendChild(el("li", null, ct.day + ": " + ct.note));
+        wl.appendChild(el("li", null, cap(ct.day) + ": " + ct.note));
       });
       c.appendChild(wl);
+      thread.appendChild(c);
+    } else if (card.type === "week_plan" && card.days) {
+      c.appendChild(el("h3", null, "This week's plan"));
+      var wul = el("ul");
+      card.days.forEach(function (d) {
+        d.meals.forEach(function (m) {
+          wul.appendChild(el("li", null, cap(d.day) + " (" + m.slot + "): " + m.title + (m.servings ? ", serves " + m.servings : "") + (m.note ? " · " + m.note : "")));
+        });
+      });
+      c.appendChild(wul);
+      thread.appendChild(c);
+    } else if (card.type === "shopping_list" && card.items) {
+      c.appendChild(el("h3", null, "Shopping list"));
+      c.appendChild(el("p", "meta", card.items.length + " to buy" + (card.skipped_have ? " · " + card.skipped_have + " already in your kitchen" : "")));
+      var sul = el("ul");
+      card.items.forEach(function (it) {
+        sul.appendChild(el("li", null, (it.quantity ? it.quantity + " " : "") + (it.raw_text || "")));
+      });
+      c.appendChild(sul);
+      thread.appendChild(c);
+    } else if (card.type === "cook_guide" && card.tasks) {
+      c.appendChild(el("h3", null, "Cook day: " + cap(card.day)));
+      if (card.focus) c.appendChild(el("p", "meta", card.focus));
+      var ol = el("ol");
+      card.tasks.forEach(function (t) {
+        ol.appendChild(el("li", null, t.text + (t.minutes ? " (" + t.minutes + " min)" : "")));
+      });
+      c.appendChild(ol);
       thread.appendChild(c);
     } else if (card.type === "plan_stub") {
       c.appendChild(el("h3", null, "One-tap week"));
@@ -133,6 +163,12 @@
   }
 
   sendBtn.addEventListener("click", send);
+  if (quickBtn) {
+    quickBtn.addEventListener("click", function () {
+      draft.value = "plan my week";
+      send();
+    });
+  }
   draft.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -140,5 +176,5 @@
     }
   });
 
-  addBubble("assistant", "Hey. This is your kitchen taking shape. Tell me what you have, what you love, and what weeknights look like. The planning brain arrives next; nothing you say is lost.");
+  addBubble("assistant", "Hey. This is your kitchen taking shape. Tell me what you have, what you love, and what weeknights look like. Tap Plan my week when you're curious; nothing you say is lost.");
 })();
